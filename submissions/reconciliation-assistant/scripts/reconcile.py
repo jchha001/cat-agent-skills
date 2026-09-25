@@ -28,19 +28,41 @@ import pandas as pd
 
 def load_table(path, sheet=None):
     lower = path.lower()
-    if lower.endswith((".xlsx", ".xlsm", ".xls")):
-        # sheet may be a name or an index; None loads the first sheet
+    if lower.endswith((".xlsx", ".xlsm")):
+        # sheet may be a name or an index; None loads the first sheet. openpyxl is the declared
+        # dependency and reads .xlsx/.xlsm. Legacy .xls needs the separate `xlrd` engine, which is
+        # NOT a declared dependency, so we do not advertise .xls here - re-save such files as .xlsx.
         return pd.read_excel(path, sheet_name=sheet if sheet is not None else 0)
     if lower.endswith(".tsv"):
         return pd.read_csv(path, sep="\t")
     return pd.read_csv(path)
 
 
+def _is_missing(value):
+    """True for any pandas/NumPy missing scalar (None, float nan, pd.NA, pd.NaT). Using
+    isinstance(value, float) alone misses pd.NA/pd.NaT (common in nullable-dtype or date columns),
+    which would otherwise fall through to str() and become literal keys like "<NA>"/"NaT" or be
+    treated as real amounts. pd.isna raises/return arrays for list-like input, so guard with a
+    scalar check and swallow the non-scalar case."""
+    if value is None:
+        return True
+    try:
+        result = pd.isna(value)
+    except (TypeError, ValueError):
+        return False
+    return bool(result) if isinstance(result, bool) or getattr(result, "ndim", 0) == 0 else False
+
+
 def default_label(path, sheet=None):
-    """A human label for a source: file name, plus sheet name when reconciling tabs."""
+    """A human label for a source: file name, plus a sheet qualifier when reconciling tabs. A
+    named sheet is appended by name; a numeric sheet index is appended as "sheet N" so two tabs of
+    the SAME workbook selected by index (e.g. 0 and 1) still get DISTINCT labels instead of
+    collapsing to the bare file name (which would make the two sides ambiguous in the report)."""
     import os
     base = os.path.splitext(os.path.basename(path))[0]
-    if sheet is not None and not isinstance(sheet, int):
+    if isinstance(sheet, int):
+        return f"{base} — sheet {sheet}"
+    if sheet is not None:
         return f"{base} — {sheet}"
     return base
 
@@ -52,7 +74,7 @@ def normalize_amount(value, norm):
     to minutely different floats and, with a zero tolerance, be pushed to "Matched (with
     difference)". Quantizing here means the matcher, the per-key model and the workbook all compare
     the same cent-rounded values (the workbook already rounds to 2 dp when classifying)."""
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if _is_missing(value):
         return None
     if isinstance(value, (int, float)):
         return round(float(value), 2)
@@ -60,9 +82,13 @@ def normalize_amount(value, norm):
     if not s:
         return None
     negative = False
-    if norm.get("parenthesesMeanNegative", True) and s.startswith("(") and s.endswith(")"):
+    # Parentheses denote a negative in accounting notation. Detect them BEFORE stripping currency
+    # symbols so a wrapped value like "$(50.00)", "USD (50.00)" or "(50.00)-" - where a currency
+    # symbol or sign sits outside the parentheses, so the string does not literally start with "(" -
+    # is still recognised as negative instead of parsing to a positive number.
+    if norm.get("parenthesesMeanNegative", True) and "(" in s and ")" in s and s.index("(") < s.rindex(")"):
         negative = True
-        s = s[1:-1]
+        s = s.replace("(", "").replace(")", "")
     if norm.get("stripCurrencySymbols", True):
         s = "".join(ch for ch in s if ch.isdigit() or ch in ".-")
     s = s.replace(",", "")
@@ -70,9 +96,9 @@ def normalize_amount(value, norm):
         amt = float(s)
     except ValueError:
         return None
-    # Parentheses denote a negative in accounting notation. Use -abs() rather than -amt so a value
-    # that ALSO carries an inner minus sign (e.g. "(-50.00)") isn't double-negated back to positive:
-    # the parentheses are authoritative for the sign, magnitude comes from the parsed number.
+    # Use -abs() rather than -amt so a value that ALSO carries an inner minus sign (e.g.
+    # "(-50.00)") isn't double-negated back to positive: the parentheses are authoritative for the
+    # sign, magnitude comes from the parsed number.
     return round(-abs(amt) if negative else amt, 2)
 
 
@@ -91,7 +117,7 @@ def norm_key(value, norm):
     # Canonicalize a key component. Integer-valued floats (e.g. 7100.0 that pandas produced
     # because another row was blank) are rendered as "7100" so a Python key matches what Excel
     # writes when it concatenates the same numeric cell - keeping all three outputs in step.
-    if value is None or (isinstance(value, float) and pd.isna(value)):
+    if _is_missing(value):
         s = ""
     elif isinstance(value, float) and value.is_integer():
         s = str(int(value))
@@ -114,12 +140,34 @@ def norm_key(value, norm):
 # join_key_parts collapses an all-empty key to "".
 KEY_DELIM = " | "
 
+# Escape sequence applied to every key COMPONENT before it is joined, both in Python
+# (_escape_key_component) and in Excel (_xl_escape_component via nested SUBSTITUTE), with the exact
+# same order. It does two jobs at once:
+#   1. Injectivity: the join delimiter contains "|", so a raw "|" inside a component would make
+#      composite keys ambiguous - ['a | b','c'] and ['a','b | c'] would both build "a | b | c".
+#      Escaping "|" removes that collision.
+#   2. Wildcard safety: Excel treats *, ?, ~ as wildcards/escapes inside SUMIF/COUNTIF criteria, so
+#      a key value containing one of them would aggregate unrelated rows. Escaping them means the
+#      stored Matching Key (and therefore every SUMIF/COUNTIF criterion built from it) contains no
+#      raw wildcard character.
+# "^" is the escape introducer (escaped first as "^^" so the mapping stays reversible/injective);
+# it is not an Excel wildcard. Components with none of ^ | * ? ~ (e.g. ordinary account codes,
+# company names, periods) pass through unchanged.
+_KEY_ESCAPES = (("^", "^^"), ("|", "^p"), ("*", "^a"), ("?", "^q"), ("~", "^t"))
+
+
+def _escape_key_component(part):
+    for raw, rep in _KEY_ESCAPES:
+        part = part.replace(raw, rep)
+    return part
+
 
 def join_key_parts(parts):
     """Join normalized key components with the shared delimiter, collapsing an all-empty key to
     "" so keyless rows are treated as keyless everywhere (matcher, workbook, HTML) instead of
-    grouping under a delimiter-only string."""
-    return KEY_DELIM.join(parts) if any(parts) else ""
+    grouping under a delimiter-only string. Each component is escaped first (see _KEY_ESCAPES) so
+    the join is injective and the resulting key carries no Excel wildcard characters."""
+    return KEY_DELIM.join(_escape_key_component(p) for p in parts) if any(parts) else ""
 
 
 def build_key(row, key_cols, norm):
@@ -151,6 +199,14 @@ def similarity(a, b):
     return SequenceMatcher(None, str(a), str(b)).ratio()
 
 
+# Difference-type labels that indicate a per-key row needs review even though the netted amounts
+# might look clean. Defined once so the Python per-key model, the HTML dashboard and the Excel
+# formulas all emit and count the identical string (the Dashboard "by type" pivot binds by COUNTIF
+# on these labels).
+DT_DUPLICATE = "Duplicate key (review)"
+DT_MISSING_AMOUNT = "Missing amount (review)"
+
+
 def within_tolerance(x, y, abs_tol, pct_tol):
     if x is None or y is None:
         return False
@@ -170,6 +226,57 @@ def effective_tolerances(matching):
     if matching.get("amountMatch") == "exact":
         return 0.0, 0.0
     return matching.get("amountToleranceAbsolute", 0.01), matching.get("amountTolerancePercent", 0.0)
+
+
+def _distinct_currencies(df, currency_col):
+    """Distinct, normalized (upper/trim) non-blank currency codes present in a source column."""
+    out = []
+    seen = set()
+    for v in df[currency_col].tolist():
+        if _is_missing(v):
+            continue
+        s = str(v).strip().upper()
+        if s and s not in seen:
+            seen.add(s); out.append(s)
+    return out
+
+
+def check_currency(df_a, df_b, config):
+    """Enforce the currency-safety guard (SKILL.md Step 2): reconciling across currencies is
+    meaningless, so refuse it rather than netting incomparable amounts. Each source may name a
+    `currencyColumn`; `normalization.expectedCurrency` may name the one currency the reconciliation
+    is expected to be in. The guard raises ValueError when:
+      - a source's currency column carries a code other than expectedCurrency, or
+      - the two sources expose different currencies, or
+      - a single source mixes multiple currencies.
+    When neither source exposes a currency column the guard cannot run and is skipped (the caller
+    is trusted to have confirmed single-currency inputs, per the SOP). Returns the resolved
+    currency (or None) for reporting."""
+    norm = config.get("normalization", {})
+    expected = norm.get("expectedCurrency")
+    expected_n = str(expected).strip().upper() if expected else None
+    found = {}
+    for side, df in (("a", df_a), ("b", df_b)):
+        col = config["sources"][side].get("currencyColumn")
+        if not col:
+            continue
+        if col not in df.columns:
+            raise ValueError(f"Source '{config['sources'][side]['label']}' names currencyColumn "
+                             f"'{col}' but it is not present. Available: {list(df.columns)}")
+        curs = _distinct_currencies(df, col)
+        found[side] = curs
+        if len(curs) > 1:
+            raise ValueError(f"Source '{config['sources'][side]['label']}' mixes multiple currencies "
+                             f"{curs}. Reconcile one currency at a time, or supply a conversion rate.")
+        if expected_n and curs and curs[0] != expected_n:
+            raise ValueError(f"Source '{config['sources'][side]['label']}' is in {curs[0]}, not the "
+                             f"expected {expected_n}. Never reconcile across currencies without an "
+                             "explicit user-supplied rate.")
+    codes = {c[0] for c in found.values() if c}
+    if len(codes) > 1:
+        raise ValueError(f"The two sources are in different currencies {sorted(codes)}. A "
+                         "cross-currency difference is meaningless; supply a conversion rate first.")
+    return (expected_n or (next(iter(codes)) if codes else None))
 
 
 def align_key_columns(config):
@@ -245,6 +352,19 @@ def reconcile(df_a, df_b, config):
     for r in b:
         b_by_key.setdefault(r["_key"], []).append(r)
 
+    # Per-side multiplicity of each real (non-empty) key. When a key occurs more than once on either
+    # side the one-to-one correspondence is ambiguous (which A row pairs with which B row?), so those
+    # exact-key pairings are surfaced as "Probable (Needs Review)" rather than silently reported as
+    # Matched on a nearest-amount guess (the per-key workbook/HTML flag the same keys - see the
+    # "Duplicate key" difftype).
+    a_key_counts, b_key_counts = {}, {}
+    for r in a:
+        if r["_key"] != "":
+            a_key_counts[r["_key"]] = a_key_counts.get(r["_key"], 0) + 1
+    for r in b:
+        if r["_key"] != "":
+            b_key_counts[r["_key"]] = b_key_counts.get(r["_key"], 0) + 1
+
     results = []
     used_b = set()
 
@@ -257,21 +377,27 @@ def reconcile(df_a, df_b, config):
         rb = candidates[0]
         used_b.add(rb["_idx"])
         ra["_matched"] = True
+        duplicate_key = a_key_counts.get(ra["_key"], 0) > 1 or b_key_counts.get(ra["_key"], 0) > 1
+        # The signed difference is always the real A-less-B amount (a blank amount counts as 0 for
+        # the tie-out identity). It is never forced to zero: a within-tolerance "Matched" pair can
+        # still carry a small real variance under a configured tolerance, and dropping it would make
+        # the global tie-out fail to close (tie_out sums these differences).
+        diff = (ra["_amt"] or 0) - (rb["_amt"] or 0)
         if ra["_amt"] is None or rb["_amt"] is None:
             # Key matches on both sides but an amount is blank/unparseable. Do not silently
-            # invent a clean variance; flag for review. The difference kept here is the
-            # balancing contribution to the tie-out identity (a blank amount contributed 0
-            # to its control total), not a fabricated "matched" number.
+            # invent a clean variance; flag for review.
             status = "Probable (Needs Review)"
-            diff = (ra["_amt"] or 0) - (rb["_amt"] or 0)
             evidence = "exact key; amount missing on one side - verify before treating as matched"
+        elif duplicate_key:
+            # Ambiguous 1:1 correspondence; the amounts may still net, but a human must confirm the
+            # pairing. Keep the real difference so the tie-out identity still balances.
+            status = "Probable (Needs Review)"
+            evidence = "exact key; duplicate key on one or both sides - 1:1 pairing is ambiguous, verify"
         elif within_tolerance(ra["_amt"], rb["_amt"], abs_tol, pct_tol):
             status = "Matched"
-            diff = 0.0
             evidence = "exact key"
         else:
             status = "Matched (with difference)"
-            diff = (ra["_amt"] or 0) - (rb["_amt"] or 0)
             evidence = "exact key"
         results.append({"status": status, "a_idx": ra["_idx"], "b_idx": rb["_idx"],
                         "key": ra["_key"], "amount_a": ra["_amt"], "amount_b": rb["_amt"],
@@ -442,15 +568,16 @@ def reconcile(df_a, df_b, config):
 
 def tie_out(results, total_a, total_b, abs_tol):
     # The identity: (total A - total B) must equal the sum of every line's net contribution.
-    # For a matched-with-difference, probable, or grouped pairing that is the recorded
-    # difference (A less B, with a blank amount counting as 0); for a one-sided item it is
-    # the present amount. Including probable/grouped keeps the identity correct whenever those
-    # tiers pair amounts within tolerance (a small non-zero delta still has to be explained).
+    # For a matched (including within-tolerance), matched-with-difference, probable, or grouped
+    # pairing that is the recorded difference (A less B, with a blank amount counting as 0); for a
+    # one-sided item it is the present amount. "Matched" is included because a within-tolerance pair
+    # can carry a small real variance that still has to be explained for the identity to close - it
+    # is exactly 0 for an exact-mode match, so this never changes exact-mode results.
     explained = 0.0
     for r in results:
         st = r["status"]
         d = r.get("difference")
-        if st in ("Matched (with difference)", "Probable (Needs Review)",
+        if st in ("Matched", "Matched (with difference)", "Probable (Needs Review)",
                   "Grouped (Needs Review)") and d is not None:
             explained += d
         elif st == "Unmatched (A)" and r.get("amount_a") is not None:
@@ -595,6 +722,20 @@ def _xl_str_literal(s):
     return '"' + str(s).replace('"', '""') + '"'
 
 
+def _xl_within_tolerance(diff_ref, a_ref, b_ref, abs_tol, pct_tol):
+    """Excel boolean expression mirroring within_tolerance(): the amounts agree when the absolute
+    difference is within abs_tol OR (when a percentage tolerance is set) within pct_tol of the
+    larger magnitude. The absolute test rounds to the cent first so binary SUM noise never masks or
+    invents a break. In exact mode (abs_tol=pct_tol=0) this reduces to ABS(ROUND(diff,2))<=0, i.e.
+    exact cent equality - identical to the old ROUND(diff,2)=0 test, so exact-mode output is
+    unchanged while configured tolerances are now honored (matching the Python matcher/HTML)."""
+    absok = f"ABS(ROUND({diff_ref},2))<={abs_tol}"
+    if pct_tol and pct_tol > 0:
+        denom = f"MAX(ABS({a_ref}),ABS({b_ref}))"
+        return f"OR({absok},AND({denom}>0,ABS({diff_ref})/{denom}*100<={pct_tol}))"
+    return absok
+
+
 def _xl_key_formula(cell_refs, norm):
     """Excel formula that concatenates key cell references into a Matching Key, mirroring
     join_key_parts()/norm_key(): each component is wrapped in TRIM() when trimWhitespace is on and
@@ -612,6 +753,10 @@ def _xl_key_formula(cell_refs, norm):
             expr = f"TRIM({expr})"
         if lower:
             expr = f"LOWER({expr})"
+        # Escape each component identically to _escape_key_component (same order: "^" first), so the
+        # Excel Matching Key is injective across the delimiter and carries no raw wildcard character.
+        for raw, rep in _KEY_ESCAPES:
+            expr = f'SUBSTITUTE({expr},"{raw}","{rep}")'
         return expr
 
     parts = [wrap(r) for r in cell_refs]
@@ -865,6 +1010,12 @@ def _write_reconciliation(ws, df_a, df_b, config, meta_a, meta_b, sa, sb):
     # labels, so the COUNTIF/COUNTIFS still bind.
     miss_a = _xl_str_literal(f"Missing in {la}")
     miss_b = _xl_str_literal(f"Missing in {lb}")
+    # Effective tolerances (0/0 in exact mode) and the review-difftype literals, so the Difference
+    # Type / Root Cause formulas honor the configured tolerance and flag duplicate keys and missing
+    # amounts with the SAME labels the Python per-key model and HTML emit.
+    abs_tol, pct_tol = effective_tolerances(config["matching"])
+    dup_lit = _xl_str_literal(DT_DUPLICATE)
+    miss_amt_lit = _xl_str_literal(DT_MISSING_AMOUNT)
     # Precompute constant column geometry ONCE (letters/indices don't change per row), so the hot
     # loop below is O(1) dict lookups instead of repeated list.index() scans (which made it
     # O(rows * cols^2) on wide/large reconciliations).
@@ -924,23 +1075,56 @@ def _write_reconciliation(ws, df_a, df_b, config, meta_a, meta_b, sa, sb):
         # Status / Difference Type / Root Cause / Action Needed (left-aligned text, v15 style).
         c_st = ws.cell(row=r, column=7 + D, value=f'=IF({L_dtype}{r}="None","Reconciled","Open Item")')
         c_st.alignment = a_left; c_st.font = f_body
+        # Difference Type, in priority order: one-sided (missing in a source) -> a present key with a
+        # blank/unparseable amount (review) -> a duplicate key on either side (ambiguous 1:1, review)
+        # -> amounts agree within the configured tolerance ("None") -> otherwise "Amount mismatch".
+        # The missing-amount test counts blank amount cells for this key (COUNTIFS ...,""); the
+        # tolerance test honors amountMatch/tolerances instead of raw equality. These mirror the
+        # Python per-key model so the workbook and HTML never disagree.
+        missing_a = f'COUNTIFS({mk_a},$A{r},{amt_a_rng},"")'
+        missing_b = f'COUNTIFS({mk_b},$A{r},{amt_b_rng},"")'
+        within = _xl_within_tolerance(f"{L_diff}{r}", f"{L_amt_a}{r}", f"{L_amt_b}{r}", abs_tol, pct_tol)
         c_dt = ws.cell(row=r, column=8 + D,
                        value=(f'=IF({L_lines_a}{r}=0,{miss_a},'
                               f'IF({L_lines_b}{r}=0,{miss_b},'
-                              f'IF(ROUND({L_diff}{r},2)=0,"None","Amount mismatch")))'))
+                              f'IF(OR({missing_a}>0,{missing_b}>0),{miss_amt_lit},'
+                              f'IF(OR({L_lines_a}{r}>1,{L_lines_b}{r}>1),{dup_lit},'
+                              f'IF({within},"None","Amount mismatch")))))'))
         c_dt.alignment = a_left; c_dt.font = f_body
-        # Root Cause: measurement (amount mismatch), timing (offsetting missing entry in the
-        # same normalized non-period group when timing applies to this row), else scope / mapping.
+        # Root Cause: measurement (amount mismatch); duplicate/missing-amount rows are scope/mapping
+        # (a review item, never timing); timing only when this row has an OFFSETTING one-sided break
+        # of the opposite side sharing the reduced key AND an equal-magnitude amount (the SUMPRODUCT
+        # amount test - diff+diff nets to ~0 - prevents two same-account rows with different balances
+        # from being mislabelled "Timing"); otherwise scope / mapping.
         if timing_on:
             rk_refs = [f"${kl}{r}" for kl in nontiming_recon_letters]
             ws.cell(row=r, column=ncols + 1, value=_xl_key_formula(rk_refs, norm)).font = f_mk
         if row_timing:
             opp = f'IF({L_dtype}{r}={miss_b},{miss_a},{miss_b})'
+            # Offsetting amount test, mirroring within_tolerance(this_amt, other_amt, abs_tol,
+            # pct_tol). For a one-sided break the row's Difference equals its present amount, so the
+            # two offsetting breaks agree when |other_diff + this_diff| is within abs_tol OR (when a
+            # percentage tolerance is set) within pct_tol% of the larger magnitude. Dropping the
+            # percent branch would let the workbook and the Python/HTML model disagree under a
+            # configured amountTolerancePercent.
+            offset = f'${L_diff}$5:${L_diff}${r_last}+{L_diff}{r}'
+            amt_ok = f'ABS({offset})<={abs_tol}'
+            if pct_tol and pct_tol > 0:
+                # Element-wise larger magnitude of the two offsetting diffs. MAX() would collapse the
+                # whole array to one scalar inside SUMPRODUCT, so build the per-element max as
+                # (ar>sc)*ar+(ar<=sc)*sc. The percent test uses multiplication (no division) so a
+                # zero denominator can't error - a genuine zero offset already passes the abs test.
+                ar = f'ABS(${L_diff}$5:${L_diff}${r_last})'
+                sc = f'ABS({L_diff}{r})'
+                denom = f'(({ar}>{sc})*{ar}+({ar}<={sc})*{sc})'
+                amt_ok = f'((ABS({offset})<={abs_tol})+(ABS({offset})<={pct_tol}/100*{denom}))'
+            timing_test = (f'SUMPRODUCT((${L_rk}$5:${L_rk}${r_last}=${L_rk}{r})*'
+                           f'(${L_dtype}$5:${L_dtype}${r_last}={opp})*'
+                           f'({amt_ok}))>0')
             root = (f'=IF({L_status}{r}="Reconciled","—",'
                     f'IF({L_dtype}{r}="Amount mismatch","Measurement",'
-                    f'IF(COUNTIFS(${L_rk}$5:${L_rk}${r_last},${L_rk}{r},'
-                    f'${L_dtype}$5:${L_dtype}${r_last},{opp})>0,'
-                    f'"Timing","Scope / mapping")))')
+                    f'IF(OR({L_dtype}{r}={dup_lit},{L_dtype}{r}={miss_amt_lit}),"Scope / mapping",'
+                    f'IF({timing_test},"Timing","Scope / mapping"))))')
         else:
             root = (f'=IF({L_status}{r}="Reconciled","—",'
                     f'IF({L_dtype}{r}="Amount mismatch","Measurement","Scope / mapping"))')
@@ -1150,7 +1334,7 @@ def _write_dashboard(ws, info, config, df_a, df_b, meta_a, meta_b, sa, sb, narra
     # Right side of the control band: open items by difference type.
     section(6, 8, "Open items by difference type")
     header(7, 8, "Difference type"); header(7, 9, "Count"); header(7, 10, "Value, ignoring sign")
-    dtypes = ["Amount mismatch", f"Missing in {la}", f"Missing in {lb}"]
+    dtypes = ["Amount mismatch", f"Missing in {la}", f"Missing in {lb}", DT_DUPLICATE, DT_MISSING_AMOUNT]
     for i, dt in enumerate(dtypes):
         row = 8 + i
         txt(ws.cell(row=row, column=8, value=dt))
@@ -1182,20 +1366,23 @@ def _write_dashboard(ws, info, config, df_a, df_b, meta_a, meta_b, sa, sb, narra
         vc.font = f_bold; vc.alignment = Alignment(horizontal="right")
         vc.number_format = fmt
 
-    section(13, 8, "Open items by root cause")
-    header(14, 8, "Root cause"); header(14, 9, "Count"); header(14, 10, "Value, ignoring sign")
+    # Open items by root cause — placed two rows below the (now variable-length) by-type total so
+    # the two right-column tables never overlap regardless of how many difference types are listed.
+    rc_sec = trow + 2
+    section(rc_sec, 8, "Open items by root cause")
+    header(rc_sec + 1, 8, "Root cause"); header(rc_sec + 1, 9, "Count"); header(rc_sec + 1, 10, "Value, ignoring sign")
     roots = ["Measurement", "Timing", "Scope / mapping"]
     for i, rt in enumerate(roots):
-        row = 15 + i
+        row = rc_sec + 2 + i
         txt(ws.cell(row=row, column=8, value=rt))
         cc9 = ws.cell(row=row, column=9, value=f"=COUNTIF({R(Mrc)},$H{row})")
         cc9.alignment = Alignment(horizontal="right"); cc9.font = f_body
         vc = ws.cell(row=row, column=10, value=f"=SUMPRODUCT(({R(Mrc)}=$H{row})*ABS({R(Fd)}))")
         vc.number_format = ACCT2; vc.font = f_body
-    rtrow = 15 + len(roots)
+    rtrow = rc_sec + 2 + len(roots)
     ws.cell(row=rtrow, column=8, value="Total").font = f_bold
-    ws.cell(row=rtrow, column=9, value=f"=SUM(I15:I{rtrow-1})").font = f_bold
-    vc = ws.cell(row=rtrow, column=10, value=f"=SUM(J15:J{rtrow-1})")
+    ws.cell(row=rtrow, column=9, value=f"=SUM(I{rc_sec + 2}:I{rtrow-1})").font = f_bold
+    vc = ws.cell(row=rtrow, column=10, value=f"=SUM(J{rc_sec + 2}:J{rtrow-1})")
     vc.font = f_bold; vc.number_format = ACCT2
 
     # ---- Difference by account (rows 21+) ----
@@ -1319,6 +1506,136 @@ def _write_dashboard(ws, info, config, df_a, df_b, meta_a, meta_b, sa, sb, narra
     return narr_rows
 
 
+def control_total_tieout(df_a, df_b, config):
+    """Control-total tie-out (SKILL.md Step 3b): one side is a control figure (or a short list of
+    control-account balances), the other is the detail that should sum to it. This is NOT a
+    line-by-line match - it proves the detail SUMS to the control and reports the variance.
+
+    controlTotal.controlSide names the control source ("a"/"b"); the other source is the detail.
+    controlTotal.controlAmountColumn is the control balance column; the detail amount is the detail
+    source's amountColumn. When controlGroupColumn (on the control side) and detailGroupColumn (on
+    the detail side) are both set, each control-account balance is tied to its detail group
+    individually and orphans on either side are reported."""
+    ct = config.get("controlTotal", {})
+    norm = config.get("normalization", {})
+    control_side = ct.get("controlSide", "a")
+    if control_side not in ("a", "b"):
+        raise ValueError("controlTotal.controlSide must be 'a' or 'b'.")
+    detail_side = "b" if control_side == "a" else "a"
+    df_c = df_a if control_side == "a" else df_b
+    df_d = df_a if detail_side == "a" else df_b
+    csrc, dsrc = config["sources"][control_side], config["sources"][detail_side]
+    clabel, dlabel = csrc.get("label", "Control"), dsrc.get("label", "Detail")
+    c_amt_col = ct.get("controlAmountColumn") or csrc["amountColumn"]
+    d_amt_col = dsrc["amountColumn"]
+    c_sign = csrc.get("signConvention", "asIs")
+    d_sign = dsrc.get("signConvention", "asIs")
+    for col, df, lab in ((c_amt_col, df_c, clabel), (d_amt_col, df_d, dlabel)):
+        if col not in df.columns:
+            raise ValueError(f"Source '{lab}' is missing the amount column '{col}'. "
+                             f"Available: {list(df.columns)}")
+
+    def csum(df, col, sign):
+        return round(sum(apply_sign(normalize_amount(v, norm), sign) or 0.0 for v in df[col].tolist()), 2)
+
+    abs_tol, _ = effective_tolerances(config.get("matching", {}))
+    cgroup, dgroup = ct.get("controlGroupColumn"), ct.get("detailGroupColumn")
+    rows = []
+    orphans_control, orphans_detail = [], []
+    if cgroup and dgroup:
+        if cgroup not in df_c.columns:
+            raise ValueError(f"Control source '{clabel}' is missing controlGroupColumn '{cgroup}'.")
+        if dgroup not in df_d.columns:
+            raise ValueError(f"Detail source '{dlabel}' is missing detailGroupColumn '{dgroup}'.")
+        # Sum each side by normalized group key.
+        c_by, d_by = {}, {}
+        c_disp, d_disp = {}, {}
+        for rec in df_c.to_dict("records"):
+            gk = norm_key(rec.get(cgroup), norm)
+            c_by[gk] = round(c_by.get(gk, 0.0) + (apply_sign(normalize_amount(rec.get(c_amt_col), norm), c_sign) or 0.0), 2)
+            c_disp.setdefault(gk, rec.get(cgroup))
+        for rec in df_d.to_dict("records"):
+            gk = norm_key(rec.get(dgroup), norm)
+            d_by[gk] = round(d_by.get(gk, 0.0) + (apply_sign(normalize_amount(rec.get(d_amt_col), norm), d_sign) or 0.0), 2)
+            d_disp.setdefault(gk, rec.get(dgroup))
+        for gk in list(c_by):
+            control = c_by[gk]
+            detail = d_by.get(gk, 0.0)
+            var = round(control - detail, 2)
+            if gk not in d_by:
+                orphans_control.append((c_disp[gk], control))
+            rows.append({"group": c_disp[gk], "control": control, "detail": detail,
+                         "variance": var, "tied": abs(var) <= abs_tol})
+        for gk in d_by:
+            if gk not in c_by:
+                orphans_detail.append((d_disp[gk], d_by[gk]))
+                rows.append({"group": d_disp[gk], "control": 0.0, "detail": d_by[gk],
+                             "variance": round(-d_by[gk], 2), "tied": abs(round(d_by[gk], 2)) <= abs_tol})
+    else:
+        control = csum(df_c, c_amt_col, c_sign)
+        detail = csum(df_d, d_amt_col, d_sign)
+        rows.append({"group": "(all)", "control": control, "detail": detail,
+                     "variance": round(control - detail, 2), "tied": abs(round(control - detail, 2)) <= abs_tol})
+
+    control_total = round(sum(r["control"] for r in rows), 2)
+    detail_total = round(sum(r["detail"] for r in rows), 2)
+    variance = round(control_total - detail_total, 2)
+    return {"mode": "control-total", "control_label": clabel, "detail_label": dlabel,
+            "grouped": bool(cgroup and dgroup), "rows": rows,
+            "control_total": control_total, "detail_total": detail_total,
+            "variance": variance, "tied_out": abs(variance) <= abs_tol,
+            "orphans_control": orphans_control, "orphans_detail": orphans_detail}
+
+
+def write_control_total_report(result, config, out_path):
+    """Write the control-total tie-out to a styled .xlsx: a per-group table (control, detail,
+    variance, tied) and a total row that proves whether the detail sums to the control."""
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = "Control-Total Tie-Out"
+    clabel, dlabel = result["control_label"], result["detail_label"]
+    f_title = Font(name=REPORT_FONT, bold=True, size=16, color=SEC_C)
+    f_hdr = Font(name=REPORT_FONT, bold=True, color=HDR_FONT)
+    f_body = Font(name=REPORT_FONT)
+    f_bold = Font(name=REPORT_FONT, bold=True)
+    hdr_fill = PatternFill("solid", fgColor=HDR_FILL)
+    right = Alignment(horizontal="right")
+
+    ws.cell(row=1, column=1, value=f"Control-total tie-out — {dlabel} against {clabel}").font = f_title
+    ws.cell(row=2, column=1,
+            value=("Proves the detail sums to the control figure. Variance = control less detail; "
+                   "a control reconciles when its variance is within tolerance.")).font = Font(name=REPORT_FONT, color=SUB_C)
+    grouped = result["grouped"]
+    ghdr = "Control account" if grouped else "Scope"
+    headers = [ghdr, f"Control ({clabel})", f"Detail sum ({dlabel})", "Variance", "Tied?"]
+    for c, name in enumerate(headers, start=1):
+        cell = ws.cell(row=4, column=c, value=name)
+        cell.fill = hdr_fill; cell.font = f_hdr
+        cell.alignment = Alignment(horizontal="center")
+    r = 5
+    for row in result["rows"]:
+        ws.cell(row=r, column=1, value=_neutralize(row["group"])).font = f_body
+        for c, key in ((2, "control"), (3, "detail"), (4, "variance")):
+            cell = ws.cell(row=r, column=c, value=row[key])
+            cell.number_format = ACCT2; cell.font = f_body; cell.alignment = right
+        tc = ws.cell(row=r, column=5, value="Tied" if row["tied"] else "NOT TIED")
+        tc.font = f_body; tc.alignment = Alignment(horizontal="center")
+        r += 1
+    ws.cell(row=r, column=1, value="Total").font = f_bold
+    for c, key in ((2, "control_total"), (3, "detail_total"), (4, "variance")):
+        cell = ws.cell(row=r, column=c, value=result[key])
+        cell.number_format = ACCT2; cell.font = f_bold; cell.alignment = right
+    tc = ws.cell(row=r, column=5, value="Tied" if result["tied_out"] else "NOT TIED")
+    tc.font = f_bold; tc.alignment = Alignment(horizontal="center")
+    for col, w in {"A": 34, "B": 20, "C": 20, "D": 16, "E": 12}.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A5"
+    wb.save(out_path)
+
+
 def write_report(results, config, out_path, df_a, df_b, src_name=None):
     import openpyxl
 
@@ -1360,10 +1677,52 @@ def write_report(results, config, out_path, df_a, df_b, src_name=None):
     info = _write_reconciliation(ws_recon, df_a, df_b, config, meta_a, meta_b, sa, sb)
     _write_dashboard(ws_dash, info, config, df_a, df_b, meta_a, meta_b, sa, sb, narrative, src_name)
 
+    # Candidate matches (Needs Review): the tiered matcher's Probable (similarity / duplicate /
+    # missing-amount) and Grouped (one-to-many split) pairings. The per-key Reconciliation sheet is
+    # an exact-key model and cannot represent a fuzzy or one-to-many pairing as a formula, so those
+    # rows would otherwise appear only as separate one-sided breaks. Listing them here (built from
+    # the `results` this function is passed) preserves the evidence and review state instead of
+    # discarding it, and points the reviewer at the underlying breaks to confirm.
+    candidates = [r for r in results if r["status"] in ("Probable (Needs Review)", "Grouped (Needs Review)")]
+    if candidates:
+        _write_candidate_matches(wb.create_sheet("Candidate Matches"), candidates, la, lb)
+
     # Fonts are applied as each cell is created (shared Font objects in the writers above), so there
     # is no whole-workbook styling pass - important for large reconciliations.
     wb.save(out_path)
     return counts
+
+
+def _write_candidate_matches(ws, candidates, la, lb):
+    """List the tiered matcher's Probable/Grouped candidate pairings with their evidence, so the
+    similarity/duplicate/grouped work is surfaced for review rather than discarded."""
+    from openpyxl.styles import Font, PatternFill, Alignment
+    f_title = Font(name=REPORT_FONT, bold=True, size=14, color=SEC_C)
+    f_hdr = Font(name=REPORT_FONT, bold=True, color=HDR_FONT)
+    f_body = Font(name=REPORT_FONT)
+    hdr_fill = PatternFill("solid", fgColor=HDR_FILL)
+    right = Alignment(horizontal="right")
+    ws.cell(row=1, column=1, value="Candidate matches — Needs Review").font = f_title
+    ws.cell(row=2, column=1, value=("Similarity, duplicate-key and grouped (one-to-many) pairings the "
+            "matcher proposes. Each is a suggestion for a human to confirm, not a posted match.")
+            ).font = Font(name=REPORT_FONT, color=SUB_C)
+    headers = ["Type", "Key", f"Amount — {la}", f"Amount — {lb}", "Difference", "Evidence"]
+    for c, name in enumerate(headers, start=1):
+        cell = ws.cell(row=4, column=c, value=name)
+        cell.fill = hdr_fill; cell.font = f_hdr; cell.alignment = Alignment(horizontal="center")
+    r = 5
+    for cand in candidates:
+        ws.cell(row=r, column=1, value=_neutralize(cand["status"])).font = f_body
+        ws.cell(row=r, column=2, value=_neutralize(str(cand.get("key", "")))).font = f_body
+        for c, key in ((3, "amount_a"), (4, "amount_b"), (5, "difference")):
+            v = cand.get(key)
+            cell = ws.cell(row=r, column=c, value=v)
+            cell.number_format = ACCT2; cell.font = f_body; cell.alignment = right
+        ws.cell(row=r, column=6, value=_neutralize(str(cand.get("evidence", "")))).font = f_body
+        r += 1
+    for col, w in {"A": 22, "B": 30, "C": 16, "D": 16, "E": 14, "F": 60}.items():
+        ws.column_dimensions[col].width = w
+    ws.freeze_panes = "A5"
 
 
 
@@ -1397,14 +1756,19 @@ def compute_reconciliation(df_a, df_b, config):
     sign_b = config["sources"]["b"].get("signConvention", "asIs")
 
     def amt_a(v):
-        return apply_sign(normalize_amount(v, norm), sign_a) or 0.0
+        return apply_sign(normalize_amount(v, norm), sign_a)
 
     def amt_b(v):
-        return apply_sign(normalize_amount(v, norm), sign_b) or 0.0
+        return apply_sign(normalize_amount(v, norm), sign_b)
+
+    abs_tol, pct_tol = effective_tolerances(config["matching"])
 
     # Aggregate each source by canonical (normalized) key string. Keyless rows (all key parts
     # blank) get a unique per-row placeholder so they are never merged together - matching the
-    # workbook helper and the record matcher, which treat an empty key as non-matchable.
+    # workbook helper and the record matcher, which treat an empty key as non-matchable. "miss"
+    # counts rows whose amount was blank/unparseable so a key carrying an invalid amount is flagged
+    # for review rather than silently treated as 0 (which could turn a blank-vs-zero into
+    # "Reconciled").
     a_recs, b_recs = df_a.to_dict("records"), df_b.to_dict("records")
     a_agg, b_agg = {}, {}
     a_first, b_first = {}, {}
@@ -1412,14 +1776,24 @@ def compute_reconciliation(df_a, df_b, config):
     for i, rec in enumerate(a_recs):
         kl = kstr(rec, a_keys) or keyless_token("A " + la, i + 2)
         if kl not in a_agg:
-            a_agg[kl] = {"sum": 0.0, "n": 0}; a_first[kl] = rec
+            a_agg[kl] = {"sum": 0.0, "n": 0, "miss": 0}; a_first[kl] = rec
             order.append(kl)
-        a_agg[kl]["sum"] += amt_a(rec[amt_a_col]); a_agg[kl]["n"] += 1
+        v = amt_a(rec[amt_a_col])
+        if v is None:
+            a_agg[kl]["miss"] += 1
+        else:
+            a_agg[kl]["sum"] += v
+        a_agg[kl]["n"] += 1
     for j, rec in enumerate(b_recs):
         kl = kstr(rec, b_keys) or keyless_token("B " + lb, j + 2)
         if kl not in b_agg:
-            b_agg[kl] = {"sum": 0.0, "n": 0}; b_first[kl] = rec
-        b_agg[kl]["sum"] += amt_b(rec[amt_b_col]); b_agg[kl]["n"] += 1
+            b_agg[kl] = {"sum": 0.0, "n": 0, "miss": 0}; b_first[kl] = rec
+        v = amt_b(rec[amt_b_col])
+        if v is None:
+            b_agg[kl]["miss"] += 1
+        else:
+            b_agg[kl]["sum"] += v
+        b_agg[kl]["n"] += 1
     for kl in b_agg:
         if kl not in a_agg:
             order.append(kl)
@@ -1435,14 +1809,24 @@ def compute_reconciliation(df_a, df_b, config):
 
     rows = []
     for kl in order:
-        aa = a_agg.get(kl, {"sum": 0.0, "n": 0})
-        bb = b_agg.get(kl, {"sum": 0.0, "n": 0})
+        aa = a_agg.get(kl, {"sum": 0.0, "n": 0, "miss": 0})
+        bb = b_agg.get(kl, {"sum": 0.0, "n": 0, "miss": 0})
         diff = round(aa["sum"] - bb["sum"], 2)
         if aa["n"] == 0:
             dtype = f"Missing in {la}"
         elif bb["n"] == 0:
             dtype = f"Missing in {lb}"
-        elif diff == 0:
+        elif aa["miss"] or bb["miss"]:
+            # A key present on both sides but with a blank/unparseable amount somewhere: the netted
+            # figure is unreliable, so surface it for review instead of calling it reconciled.
+            dtype = DT_MISSING_AMOUNT
+        elif aa["n"] > 1 or bb["n"] > 1:
+            # Duplicate key on one or both sides: the one-to-one correspondence is ambiguous even
+            # when the totals happen to net, so it must be reviewed rather than shown as Reconciled.
+            dtype = DT_DUPLICATE
+        elif within_tolerance(aa["sum"], bb["sum"], abs_tol, pct_tol):
+            # Honor the configured tolerance (0/0 in exact mode) instead of testing raw equality, so
+            # the HTML agrees with the matcher: a within-tolerance pair is reconciled.
             dtype = "None"
         else:
             dtype = "Amount mismatch"
@@ -1474,17 +1858,25 @@ def compute_reconciliation(df_a, df_b, config):
             r["rootcause"] = "—"
         elif r["difftype"] == "Amount mismatch":
             r["rootcause"] = "Measurement"
+        elif r["difftype"] in (DT_DUPLICATE, DT_MISSING_AMOUNT):
+            r["rootcause"] = "Scope / mapping"
         else:
             # Group offsetting entries by the NORMALIZED reduced key (norm_key per non-timing
             # component), so the timing classification matches the matcher and the workbook helper
             # even when non-timing key parts differ only by whitespace/case. norm_key also collapses
             # NaN/blank components to "" (str(NaN) would be the truthy "nan"), so keyless /
-            # blank-reduced rows are correctly excluded from timing.
+            # blank-reduced rows are correctly excluded from timing. A genuine timing pair must be an
+            # OFFSETTING one-sided break (opposite Missing-in side) whose amount equals this row's
+            # amount within tolerance - not merely any opposite break sharing the reduced key - so
+            # two same-account rows with DIFFERENT balances are not mislabelled "Timing".
             gk = tuple(norm_key(field(r["key"], k), norm) for k in nontiming)
             opp = f"Missing in {la}" if r["difftype"] == f"Missing in {lb}" else f"Missing in {lb}"
+            this_amt = r["amt_a"] if r["difftype"] == f"Missing in {lb}" else r["amt_b"]
             reduced_nonempty = any(gk)
-            has_offset = (timing_on and reduced_nonempty
-                          and any(o["difftype"] == opp for o in grp.get(gk, [])))
+            has_offset = (timing_on and reduced_nonempty and any(
+                o["difftype"] == opp
+                and within_tolerance(this_amt, (o["amt_a"] if opp == f"Missing in {lb}" else o["amt_b"]), abs_tol, pct_tol)
+                for o in grp.get(gk, [])))
             r["rootcause"] = "Timing" if has_offset else "Scope / mapping"
     return rows, la, lb
 
@@ -1623,7 +2015,8 @@ def build_html_dashboard(rows, config, src_name=None, df_a=None, df_b=None):
                 body += f'<tr><td>{e(k)}</td><td class="num">{c:,}</td><td class="num">{_num(v)}</td></tr>'
         body += f'<tr class="total"><td>Total</td><td class="num">{tc:,}</td><td class="num">{_num(tv)}</td></tr>'
         return body
-    type_body = kv_table(by_type, ["Amount mismatch", f"Missing in {la}", f"Missing in {lb}"])
+    type_body = kv_table(by_type, ["Amount mismatch", f"Missing in {la}", f"Missing in {lb}",
+                                   DT_DUPLICATE, DT_MISSING_AMOUNT])
     root_body = kv_table(by_root, ["Measurement", "Timing", "Scope / mapping"])
 
     # ---- account table ----
@@ -1903,23 +2296,57 @@ def main():
     la = config["sources"]["a"]["label"]
     lb = config["sources"]["b"]["label"]
 
-    # This reference script implements the record-to-record tiered match. Control-total
-    # tie-out (SKILL.md Step 3b) is an analytical method the agent performs directly; the
-    # script does not run it, so refuse rather than silently emit record-to-record output.
+    # Dispatch on reconciliation mode. Record-to-record (default) runs the tiered matcher; the
+    # control-total mode proves the detail sums to a control figure (SKILL.md Step 3b) and is now
+    # produced by the script rather than refused.
     mode = config.get("matching", {}).get("reconciliationMode", "recordToRecord")
+    control_modes = {"controltotal", "control-total", "controltotaltieout"}
+    if isinstance(mode, str) and mode.strip().lower() in control_modes:
+        # Currency safety applies to every mode.
+        try:
+            check_currency(df_a, df_b, config)
+            ct_result = control_total_tieout(df_a, df_b, config)
+        except ValueError as e:
+            sys.exit(f"Control-total tie-out failed: {e}")
+        write_control_total_report(ct_result, config, args.out)
+        print(f"Control-total tie-out written to {args.out}")
+        print(f"Control ({ct_result['control_label']}) = {ct_result['control_total']:.2f} | "
+              f"Detail ({ct_result['detail_label']}) = {ct_result['detail_total']:.2f} | "
+              f"variance = {ct_result['variance']:.2f}")
+        print(f"Tied out: {'YES' if ct_result['tied_out'] else 'NO'}")
+        if ct_result["grouped"]:
+            not_tied = [r for r in ct_result["rows"] if not r["tied"]]
+            print(f"  Control groups: {len(ct_result['rows'])} ({len(not_tied)} not tied)")
+            if ct_result["orphans_detail"]:
+                print(f"  Detail groups with no control: {len(ct_result['orphans_detail'])}")
+            if ct_result["orphans_control"]:
+                print(f"  Control groups with no detail: {len(ct_result['orphans_control'])}")
+        return
     if mode and mode != "recordToRecord":
-        sys.exit(f"reconciliationMode '{mode}' is not run by this script. It implements "
-                 "record-to-record matching only; perform control-total tie-out analytically "
-                 "per SKILL.md Step 3b, or set matching.reconciliationMode to 'recordToRecord'.")
+        sys.exit(f"reconciliationMode '{mode}' is not recognized. Use 'recordToRecord' for the "
+                 "tiered line-by-line match, or a control-total mode "
+                 "('controlTotal') to prove a detail list sums to a control figure.")
 
-    # Confirm configured columns exist before matching.
+    # Confirm configured columns exist before matching (keys, amount, and any optional date or
+    # currency column - a misspelled dateColumn would otherwise make the similarity tier silently
+    # skip candidates instead of matching, and a misspelled currencyColumn would skip the guard).
     for side, df in (("a", df_a), ("b", df_b)):
         s = config["sources"][side]
         needed = list(s["keyColumns"]) + [s["amountColumn"]]
+        for opt in ("dateColumn", "currencyColumn"):
+            if s.get(opt):
+                needed.append(s[opt])
         missing = [c for c in needed if c not in df.columns]
         if missing:
             sys.exit(f"Source '{s['label']}' is missing configured column(s): {missing}. "
                      f"Available: {list(df.columns)}")
+
+    # Currency safety: never reconcile across currencies (SKILL.md Step 2). Refuse with a clear
+    # message rather than netting incomparable amounts.
+    try:
+        check_currency(df_a, df_b, config)
+    except ValueError as e:
+        sys.exit(f"Currency check failed: {e}")
 
     results, total_a, total_b = reconcile(df_a, df_b, config)
     summary = tie_out(results, total_a, total_b, effective_tolerances(config["matching"])[0])

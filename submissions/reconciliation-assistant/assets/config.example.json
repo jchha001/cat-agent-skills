@@ -6,6 +6,7 @@
       "keyColumns": ["Company", "Account No.", "Period"],
       "amountColumn": "Balance",
       "dateColumn": null,
+      "currencyColumn": null,
       "signConvention": "asIs"
     },
     "b": {
@@ -14,6 +15,7 @@
       "keyColumns": ["Company", "Account No.", "Period"],
       "amountColumn": "Balance",
       "dateColumn": null,
+      "currencyColumn": null,
       "signConvention": "asIs"
     }
   },

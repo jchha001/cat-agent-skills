@@ -10,11 +10,13 @@ A reconciliation compares two sources that *should* describe the same set of rec
 |---|---|
 | Matched | Same record in both sources, amounts agree within tolerance. |
 | Matched (with difference) | Same record in both sources, amounts disagree. A real break. |
-| Probable (Needs Review) | No exact key, but a similarity pair cleared every threshold. A suggestion. |
+| Probable (Needs Review) | No exact key, but a similarity pair cleared every threshold; OR an exact key that is ambiguous - it occurs more than once on a side (duplicate key), or an amount is blank/unparseable. A suggestion, never a posted match. |
 | Grouped (Needs Review) | One record on one side corresponds to several on the other (split/partial). |
 | Unmatched (A) / Unmatched (B) | Present in one source only. Reported with Difference Type "Missing in &lt;source name&gt;". |
 
 The pool shrinks as tiers run: once a record is matched (or placed in a group), it leaves the pool and cannot match again. This guarantees one-to-one integrity and makes the result deterministic.
+
+The per-key workbook and HTML mirror these states with their **Difference Type** column: a key that occurs more than once on either side is **Duplicate key (review)** and a key carrying a blank/unparseable amount is **Missing amount (review)** - neither is ever shown as "Reconciled" even when the netted totals happen to agree, because the one-to-one correspondence is not established. The per-key views honor the same `amountMatch` tolerance as the matcher, so a within-tolerance pair reads "Reconciled" in every output.
 
 ## Tier 1 - Exact match
 

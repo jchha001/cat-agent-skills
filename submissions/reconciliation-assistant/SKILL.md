@@ -28,7 +28,7 @@ Two more rules follow from that one:
 
 **Identify the two sources.** Establish the two datasets to reconcile, and how each is provided:
 
-- Two separate files (`.xlsx`, `.xlsm`, `.xls`, `.csv`, `.tsv`) - the usual case on Cowork and Scout.
+- Two separate files (`.xlsx`, `.xlsm`, `.csv`, `.tsv`) - the usual case on Cowork and Scout. Legacy `.xls` is not read directly by `scripts/reconcile.py` (it needs the extra `xlrd` engine, which is not a declared dependency) - re-save such a file as `.xlsx` first.
 - **Two sheets/tabs within a single workbook** - very common (a user uploads one file with, say, a "System" tab and a "Manual" tab). Set each source's `sheet` to the tab name; both sources can point at the same file. When you detect one workbook with multiple tabs, ask which two tabs to reconcile rather than assuming.
 - A specific sheet or named range within a workbook.
 - Tables pasted directly into the conversation - common on Copilot Studio.
@@ -97,9 +97,9 @@ Matching on raw values is the most common source of false breaks. Before any com
 - **Whitespace and case.** Trim surrounding whitespace on keys; compare keys case-insensitively when `normalization.caseInsensitiveKeys` is on. "INV-1001" and "inv-1001 " are the same key.
 - **Amounts.** Strip currency symbols and thousands separators. Interpret parentheses as negative when `parenthesesMeanNegative` is on (`(50.00)` = `-50.00`). Apply each source's `signConvention`: some systems record outflows as positive, others as negative - normalize both to a common sign before comparing, or the matched amounts will differ by exactly twice the value.
 - **Dates.** Parse to a single ISO format. Watch for ambiguous `MM/DD` vs `DD/MM` - if a column parses inconsistently, flag it in Diagnostics rather than silently choosing one.
-- **Currency.** If both sources expose a currency and any row's currency differs from `expectedCurrency` (or the two sources disagree), **stop and ask** - never reconcile across currencies without an explicit conversion rate the user supplies. A cross-currency "difference" is meaningless.
+- **Currency.** Set each source's `currencyColumn` when it has one, and `normalization.expectedCurrency` to the currency the reconciliation should be in. On a code-capable host `scripts/reconcile.py` then enforces this: it **stops with an error** if a source carries a currency other than `expectedCurrency`, if the two sources disagree, or if one source mixes currencies. Never reconcile across currencies without an explicit conversion rate the user supplies - a cross-currency "difference" is meaningless.
 
-Also record, per source, any **intra-source duplicates** (two rows with the same key) - these are reported in Diagnostics and handled carefully in matching, because a duplicate key makes a one-to-one match ambiguous.
+Also record, per source, any **intra-source duplicates** (two rows with the same key) - these are reported in Diagnostics and handled carefully in matching, because a duplicate key makes a one-to-one match ambiguous. In the workbook and HTML a duplicate key is classified **Duplicate key (review)** (never silently "Reconciled" even if the totals happen to net), and a key present on both sides but carrying a blank/unparseable amount is classified **Missing amount (review)**; both are open items for a human to confirm.
 
 ## Step 3 - Match in tiers
 
@@ -116,7 +116,7 @@ Never relax a threshold silently to force a match. If the user wants looser matc
 
 ## Step 3b - Control-total tie-out (alternative to Step 3)
 
-When the run is in **control-total mode**, do not run the record-to-record tiers. Instead:
+When the run is in **control-total mode**, do not run the record-to-record tiers. On a code-capable host, `scripts/reconcile.py` runs this mode directly when `matching.reconciliationMode` is `controlTotal` (it reads the `controlTotal` block and writes a tie-out `.xlsx`); on a host that cannot run code, follow the same steps analytically. Either way:
 
 1. **Identify the control figure and the detail list.** `controlTotal.controlSide` names which source holds the control figure(s); the other source is the detail. `controlTotal.controlAmountColumn` is the column on the control side holding the balance.
 2. **Single control figure.** If the control side is one number (one row), sum the detail's amount column and compare to it. Report: control figure, detail sum, and the **variance** (control − detail). If the variance is within tolerance, the control **ties out**; if not, it does not, and the variance is the number to investigate.
@@ -143,16 +143,17 @@ Compute both sides and confirm they are equal within tolerance. If they do not t
 
 ## Step 5 - Produce the report
 
-In **record-to-record** mode, build a formatted workbook (or inline tables where the host can't write a file), labelled in the user's own terms - source labels drawn from the file/tab names, never "A" and "B". The layout reads the way an accountant expects, not as a raw dump. Where the host can execute code, the workbook is **formula-driven**: every amount, count, status, and classification is written as a live Excel formula (`SUMIF`/`COUNTIF`/`IF`/`SUMPRODUCT`) over the two source tabs, so a reviewer can edit a source balance and watch the whole reconciliation - and its control checks - recompute. The workbook has four sheets:
+In **record-to-record** mode, build a formatted workbook (or inline tables where the host can't write a file), labelled in the user's own terms - source labels drawn from the file/tab names, never "A" and "B". The layout reads the way an accountant expects, not as a raw dump. Where the host can execute code, the workbook is **formula-driven**: every amount, count, status, and classification is written as a live Excel formula (`SUMIF`/`COUNTIF`/`IF`/`SUMPRODUCT`) over the two source tabs, so a reviewer can edit a source balance and watch the whole reconciliation - and its control checks - recompute. The workbook has four core sheets (plus a fifth, **Candidate Matches**, only when the matcher proposes any):
 
 - **Dashboard** - the sign-off front page. A title banner and basis-of-preparation line, then:
   - **Control panel** - a short list of controls that must each read **OK** before sign-off (every key appears once; each side's amounts agree to its source tab; the total difference proves to the two ledger totals; reconciled + open items equal total lines). Each control shows Result, Expected, and an OK/CHECK status computed by formula.
   - **Reconciliation summary** - total lines, reconciled, open items, match rate, net difference, and gross difference (ignoring sign).
-  - **Open items by difference type** and **Open items by root cause** - count and value (ignoring sign) for each type (amount mismatch / missing in each source) and each root cause (Measurement / Timing / Scope / mapping), each with a total.
+  - **Open items by difference type** and **Open items by root cause** - count and value (ignoring sign) for each type (amount mismatch / missing in each source / duplicate key (review) / missing amount (review)) and each root cause (Measurement / Timing / Scope / mapping), each with a total.
   - **Difference by account** and **Difference by company and period** - per-account and per-bucket pivots of both sides, the difference, and the open-item count.
   - **Headlines** - a plain-English driver narrative (match rate, net/gross, biggest driver, root-cause split, timing note).
-- **Reconciliation** - the detail: **one row per matching key** with a **Matching Key** column, the descriptive key columns, both balances side by side, the signed **Difference**, **Lines in** each source, a two-state **Status** (Reconciled / Open Item), a **Difference Type** (amount mismatch / missing in one source / none), a **Root Cause** (Measurement for amount mismatches; Timing where an offsetting entry sits in the adjacent period; Scope / mapping otherwise), and an **Action Needed** step - all derived by formula. A totals row and a "proves to nil" control row close the sheet. Status is colour-cued (Reconciled / Open Item) by conditional formatting so it survives edits.
+- **Reconciliation** - the detail: **one row per matching key** with a **Matching Key** column, the descriptive key columns, both balances side by side, the signed **Difference**, **Lines in** each source, a two-state **Status** (Reconciled / Open Item), a **Difference Type** (amount mismatch / missing in one source / duplicate key (review) / missing amount (review) / none), a **Root Cause** (Measurement for amount mismatches; Timing where an offsetting entry of equal amount sits in the adjacent period; Scope / mapping otherwise, including duplicate-key and missing-amount review items), and an **Action Needed** step - all derived by formula, honoring the configured amount tolerance. A totals row and a "proves to nil" control row close the sheet. Status is colour-cued (Reconciled / Open Item) by conditional formatting so it survives edits.
 - **Two source tabs** - each input ledger reproduced verbatim plus an appended **Matching Key** helper column, so every reconciliation formula binds to a visible, auditable range.
+- **Candidate Matches** (only when present) - the matcher's Probable (similarity / duplicate-key / missing-amount) and Grouped (one-to-many split) pairings listed with their evidence, so those suggestions are surfaced for a human to confirm rather than left implicit in the one-sided breaks.
 
 Numbers use a single consistent format throughout (thousands with two decimals, negatives in parentheses).
 
