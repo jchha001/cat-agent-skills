@@ -161,10 +161,10 @@ Numbers use a single consistent format throughout (thousands with two decimals, 
 
 In **control-total** mode, the report is:
 
-- **Tie-out** - one line per control figure: the control amount, the detail sum, the variance, and tied/not-tied. For a single control figure this is one row; for multiple control accounts it is one row each plus a grand total.
+- **Tie-out** - one line per control figure: the control amount, the detail sum, the variance, and tied/not-tied. A group is tied only when its variance is within the configured tolerance (absolute **or** percentage, the same rule as record-to-record mode) **and** it carries no blank/unparseable amount rows. For a single control figure this is one row; for multiple control accounts it is one row each plus a grand total.
 - **Detail** - the detail rows, grouped by control account when a group column is set, so a reviewer can see what makes up each sum.
 - **Orphans** - detail rows matching no control account, and control accounts with no detail.
-- **Diagnostics** - same as above.
+- **Missing amounts** - any blank or unparseable amount is counted and flagged (never silently treated as zero); while any remain, the tie-out is reported as not trustworthy so the reviewer investigates them.
 
 **Execution by platform** (details in `references/platform-notes.md`):
 

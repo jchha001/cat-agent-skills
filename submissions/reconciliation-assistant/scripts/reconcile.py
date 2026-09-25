@@ -1535,56 +1535,84 @@ def control_total_tieout(df_a, df_b, config):
             raise ValueError(f"Source '{lab}' is missing the amount column '{col}'. "
                              f"Available: {list(df.columns)}")
 
-    def csum(df, col, sign):
-        return round(sum(apply_sign(normalize_amount(v, norm), sign) or 0.0 for v in df[col].tolist()), 2)
+    def amt_or_missing(v, sign):
+        a = apply_sign(normalize_amount(v, norm), sign)
+        return (a, False) if a is not None else (0.0, True)
 
-    abs_tol, _ = effective_tolerances(config.get("matching", {}))
+    abs_tol, pct_tol = effective_tolerances(config.get("matching", {}))
+
+    def is_tied(control, detail):
+        # Honor BOTH tolerances exactly like the record-to-record matcher: within abs_tol OR (when a
+        # percentage tolerance is set) within pct_tol% of the larger magnitude. In exact mode
+        # (0,0) this is exact-cent equality.
+        return within_tolerance(control, detail, abs_tol, pct_tol)
+
     cgroup, dgroup = ct.get("controlGroupColumn"), ct.get("detailGroupColumn")
     rows = []
+    detail_rows = []            # every detail record with its group + amount (Detail section)
     orphans_control, orphans_detail = [], []
+    missing_control = missing_detail = 0
     if cgroup and dgroup:
         if cgroup not in df_c.columns:
             raise ValueError(f"Control source '{clabel}' is missing controlGroupColumn '{cgroup}'.")
         if dgroup not in df_d.columns:
             raise ValueError(f"Detail source '{dlabel}' is missing detailGroupColumn '{dgroup}'.")
-        # Sum each side by normalized group key.
+        # Sum each side by normalized group key, tracking blank/unparseable amounts per group so a
+        # tie is never reported over invalid rows without a diagnostic.
         c_by, d_by = {}, {}
         c_disp, d_disp = {}, {}
         for rec in df_c.to_dict("records"):
             gk = norm_key(rec.get(cgroup), norm)
-            c_by[gk] = round(c_by.get(gk, 0.0) + (apply_sign(normalize_amount(rec.get(c_amt_col), norm), c_sign) or 0.0), 2)
+            amt, miss = amt_or_missing(rec.get(c_amt_col), c_sign)
+            e = c_by.setdefault(gk, {"sum": 0.0, "miss": 0}); e["sum"] = round(e["sum"] + amt, 2); e["miss"] += miss
+            missing_control += miss
             c_disp.setdefault(gk, rec.get(cgroup))
         for rec in df_d.to_dict("records"):
             gk = norm_key(rec.get(dgroup), norm)
-            d_by[gk] = round(d_by.get(gk, 0.0) + (apply_sign(normalize_amount(rec.get(d_amt_col), norm), d_sign) or 0.0), 2)
+            amt, miss = amt_or_missing(rec.get(d_amt_col), d_sign)
+            e = d_by.setdefault(gk, {"sum": 0.0, "miss": 0}); e["sum"] = round(e["sum"] + amt, 2); e["miss"] += miss
+            missing_detail += miss
             d_disp.setdefault(gk, rec.get(dgroup))
+            detail_rows.append({"group": rec.get(dgroup), "amount": amt, "missing": bool(miss)})
         for gk in list(c_by):
-            control = c_by[gk]
-            detail = d_by.get(gk, 0.0)
+            control = c_by[gk]["sum"]
+            detail = d_by.get(gk, {"sum": 0.0})["sum"]
             var = round(control - detail, 2)
+            grp_miss = c_by[gk]["miss"] + d_by.get(gk, {"miss": 0})["miss"]
             if gk not in d_by:
                 orphans_control.append((c_disp[gk], control))
-            rows.append({"group": c_disp[gk], "control": control, "detail": detail,
-                         "variance": var, "tied": abs(var) <= abs_tol})
+            # A group with a blank/unparseable amount is never reported tied - the sum is unreliable.
+            rows.append({"group": c_disp[gk], "control": control, "detail": detail, "variance": var,
+                         "missing": grp_miss, "tied": grp_miss == 0 and is_tied(control, detail)})
         for gk in d_by:
             if gk not in c_by:
-                orphans_detail.append((d_disp[gk], d_by[gk]))
-                rows.append({"group": d_disp[gk], "control": 0.0, "detail": d_by[gk],
-                             "variance": round(-d_by[gk], 2), "tied": abs(round(d_by[gk], 2)) <= abs_tol})
+                orphans_detail.append((d_disp[gk], d_by[gk]["sum"]))
+                grp_miss = d_by[gk]["miss"]
+                rows.append({"group": d_disp[gk], "control": 0.0, "detail": d_by[gk]["sum"],
+                             "variance": round(-d_by[gk]["sum"], 2), "missing": grp_miss,
+                             "tied": grp_miss == 0 and is_tied(0.0, d_by[gk]["sum"])})
     else:
-        control = csum(df_c, c_amt_col, c_sign)
-        detail = csum(df_d, d_amt_col, d_sign)
+        control = detail = 0.0
+        for v in df_c[c_amt_col].tolist():
+            amt, miss = amt_or_missing(v, c_sign); control = round(control + amt, 2); missing_control += miss
+        for rec in df_d.to_dict("records"):
+            amt, miss = amt_or_missing(rec.get(d_amt_col), d_sign); detail = round(detail + amt, 2); missing_detail += miss
+            detail_rows.append({"group": "(all)", "amount": amt, "missing": bool(miss)})
+        grp_miss = missing_control + missing_detail
         rows.append({"group": "(all)", "control": control, "detail": detail,
-                     "variance": round(control - detail, 2), "tied": abs(round(control - detail, 2)) <= abs_tol})
+                     "variance": round(control - detail, 2), "missing": grp_miss,
+                     "tied": grp_miss == 0 and is_tied(control, detail)})
 
     control_total = round(sum(r["control"] for r in rows), 2)
     detail_total = round(sum(r["detail"] for r in rows), 2)
     variance = round(control_total - detail_total, 2)
+    total_missing = missing_control + missing_detail
     return {"mode": "control-total", "control_label": clabel, "detail_label": dlabel,
-            "grouped": bool(cgroup and dgroup), "rows": rows,
+            "grouped": bool(cgroup and dgroup), "rows": rows, "detail_rows": detail_rows,
             "control_total": control_total, "detail_total": detail_total,
-            "variance": variance, "tied_out": abs(variance) <= abs_tol,
-            "orphans_control": orphans_control, "orphans_detail": orphans_detail}
+            "variance": variance, "tied_out": total_missing == 0 and is_tied(control_total, detail_total),
+            "orphans_control": orphans_control, "orphans_detail": orphans_detail,
+            "missing_control": missing_control, "missing_detail": missing_detail}
 
 
 def write_control_total_report(result, config, out_path):
@@ -1610,7 +1638,7 @@ def write_control_total_report(result, config, out_path):
                    "a control reconciles when its variance is within tolerance.")).font = Font(name=REPORT_FONT, color=SUB_C)
     grouped = result["grouped"]
     ghdr = "Control account" if grouped else "Scope"
-    headers = [ghdr, f"Control ({clabel})", f"Detail sum ({dlabel})", "Variance", "Tied?"]
+    headers = [ghdr, f"Control ({clabel})", f"Detail sum ({dlabel})", "Variance", "Tied?", "Note"]
     for c, name in enumerate(headers, start=1):
         cell = ws.cell(row=4, column=c, value=name)
         cell.fill = hdr_fill; cell.font = f_hdr
@@ -1623,6 +1651,11 @@ def write_control_total_report(result, config, out_path):
             cell.number_format = ACCT2; cell.font = f_body; cell.alignment = right
         tc = ws.cell(row=r, column=5, value="Tied" if row["tied"] else "NOT TIED")
         tc.font = f_body; tc.alignment = Alignment(horizontal="center")
+        # Flag groups that carry a blank/unparseable amount so a reviewer sees why an untied group
+        # cannot be trusted rather than seeing a silent 0.
+        if row.get("missing"):
+            note = f'{row["missing"]} blank/unparseable amount row(s) — verify'
+            ws.cell(row=r, column=6, value=note).font = f_body
         r += 1
     ws.cell(row=r, column=1, value="Total").font = f_bold
     for c, key in ((2, "control_total"), (3, "detail_total"), (4, "variance")):
@@ -1630,7 +1663,55 @@ def write_control_total_report(result, config, out_path):
         cell.number_format = ACCT2; cell.font = f_bold; cell.alignment = right
     tc = ws.cell(row=r, column=5, value="Tied" if result["tied_out"] else "NOT TIED")
     tc.font = f_bold; tc.alignment = Alignment(horizontal="center")
-    for col, w in {"A": 34, "B": 20, "C": 20, "D": 16, "E": 12}.items():
+    tot_missing = result.get("missing_control", 0) + result.get("missing_detail", 0)
+    if tot_missing:
+        ws.cell(row=r, column=6,
+                value=f'{tot_missing} blank/unparseable amount row(s) across sources — tie-out not trustworthy until resolved').font = f_bold
+    r += 2
+
+    # Orphans section: control accounts with no detail, and detail groups with no control account -
+    # each is a real finding (a mis-coded entry or a control that should be empty and is not).
+    if result["orphans_control"] or result["orphans_detail"]:
+        ws.cell(row=r, column=1, value="Orphans (no counterpart)").font = Font(name=REPORT_FONT, bold=True, size=13, color=SEC_C)
+        r += 1
+        for c, name in enumerate(["Side", ghdr, "Amount"], start=1):
+            cell = ws.cell(row=r, column=c, value=name); cell.fill = hdr_fill; cell.font = f_hdr
+            cell.alignment = Alignment(horizontal="center")
+        r += 1
+        for grp, amt in result["orphans_control"]:
+            ws.cell(row=r, column=1, value=f"Control with no {dlabel}").font = f_body
+            ws.cell(row=r, column=2, value=_neutralize(grp)).font = f_body
+            ac = ws.cell(row=r, column=3, value=amt); ac.number_format = ACCT2; ac.font = f_body; ac.alignment = right
+            r += 1
+        for grp, amt in result["orphans_detail"]:
+            ws.cell(row=r, column=1, value=f"{dlabel} with no control").font = f_body
+            ws.cell(row=r, column=2, value=_neutralize(grp)).font = f_body
+            ac = ws.cell(row=r, column=3, value=amt); ac.number_format = ACCT2; ac.font = f_body; ac.alignment = right
+            r += 1
+        r += 1
+
+    # Detail section: the detail rows that make up each control sum, so a reviewer can see the
+    # composition behind a variance (grouped by control account when a group column is set).
+    detail_rows = result.get("detail_rows", [])
+    if detail_rows:
+        ws.cell(row=r, column=1, value=f"Detail — {dlabel}").font = Font(name=REPORT_FONT, bold=True, size=13, color=SEC_C)
+        r += 1
+        det_hdr = ([ghdr, "Amount", "Note"] if grouped else ["Amount", "Note"])
+        for c, name in enumerate(det_hdr, start=1):
+            cell = ws.cell(row=r, column=c, value=name); cell.fill = hdr_fill; cell.font = f_hdr
+            cell.alignment = Alignment(horizontal="center")
+        r += 1
+        for d in detail_rows:
+            col = 1
+            if grouped:
+                ws.cell(row=r, column=col, value=_neutralize(d["group"])).font = f_body; col += 1
+            ac = ws.cell(row=r, column=col, value=d["amount"]); ac.number_format = ACCT2
+            ac.font = f_body; ac.alignment = right; col += 1
+            if d["missing"]:
+                ws.cell(row=r, column=col, value="blank/unparseable amount").font = f_body
+            r += 1
+
+    for col, w in {"A": 34, "B": 22, "C": 20, "D": 16, "E": 12, "F": 46}.items():
         ws.column_dimensions[col].width = w
     ws.freeze_panes = "A5"
     wb.save(out_path)
@@ -2314,6 +2395,9 @@ def main():
               f"Detail ({ct_result['detail_label']}) = {ct_result['detail_total']:.2f} | "
               f"variance = {ct_result['variance']:.2f}")
         print(f"Tied out: {'YES' if ct_result['tied_out'] else 'NO'}")
+        tot_missing = ct_result.get("missing_control", 0) + ct_result.get("missing_detail", 0)
+        if tot_missing:
+            print(f"  WARNING: {tot_missing} blank/unparseable amount row(s) - tie-out not trustworthy until resolved")
         if ct_result["grouped"]:
             not_tied = [r for r in ct_result["rows"] if not r["tied"]]
             print(f"  Control groups: {len(ct_result['rows'])} ({len(not_tied)} not tied)")
