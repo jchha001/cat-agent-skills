@@ -42,7 +42,7 @@ The protection layer is the reason this skill is safe to run. Every rule below e
 
 ## Rule: Unread and recent
 
-**What it does.** Any unread message received in the last 3 days is protected. One narrow exception: a message whose sender local part matches a high-confidence automation pattern (`noreply|no-reply|donotreply|do-not-reply|notifications|alerts|automated|system|bot`) may still be classified as `notifications`. Newsletters (matched only by `List-Unsubscribe` or bulk-mail domain) never bypass this rule.
+**What it does.** Any unread message received in the last 3 days is protected. One narrow exception: a message whose sender local part matches a **bounded** high-confidence automation token (`noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `bot`, ... - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) may still be classified as `notifications`. Newsletters (matched only by `List-Unsubscribe` or bulk-mail domain) never bypass this rule.
 
 **Why it exists.** Fresh mail is fresh signal. The user has not made a call on it yet, and the point of triage is to reduce noise, not to make triage decisions on the user's behalf before they see anything. The `noreply@` exception is for the case where the whole point of the run was "get rid of the fresh notification noise" - which is a common trigger. Newsletters are excluded from the exception because a "MEGA SALE ENDS TONIGHT" blast is exactly the kind of item a user might scan on the day it arrives.
 

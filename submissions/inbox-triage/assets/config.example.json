@@ -43,10 +43,12 @@
     "Accepted:",
     "Declined:",
     "Tentative:",
+    "Meeting Forward Notification:"
+  ],
+  "meetingForwardLookingPrefixes": [
     "Canceled:",
     "Cancelled:",
-    "Updated invitation:",
-    "Meeting Forward Notification:"
+    "Updated invitation:"
   ],
   "unsubscribe": {
     "extractAndDisplay": true,

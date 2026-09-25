@@ -48,7 +48,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 **Positive tests (any one is sufficient):**
 
-- Sender local part starts with, case-insensitive: `noreply|no-reply|notifications|alerts|donotreply|do-not-reply|automated|system|robot|bot|jenkins|ci|deploy`.
+- Sender local part (case-insensitive) is one of these automation tokens, **bounded** so it is not merely a prefix of a real word: the local part either equals the token exactly, or the token is immediately followed by a separator (`-`, `_`, `.`, `+`) or a digit. Tokens: `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `robot`, `bot`, `jenkins`, `ci`, `deploy`. So `bot@`, `bot-ci@`, `system.alerts@`, `ci-01@` match, but `botany@`, `systematic@`, `cinema@` do **not** (the token boundary check is what prevents those false positives, which would otherwise be moved and also wrongly granted the unread-message exception below).
 - Sender domain matches a known automation platform:
   - `atlassian.net`, `jira.com`, `bitbucket.org`
   - `github.com`, `github-noreply.com` (except `notifications@github.com` for security alerts - see below)
@@ -78,25 +78,26 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 ## pastEvents
 
-Because Step 1 collects only subject, sender, and received time - it does **not** open calendar items or message bodies - this bucket is scoped to what those fields alone can prove. The meeting-response prefixes split into two groups:
+Because Step 1 collects only subject, sender, and received time - it does **not** open calendar items or message bodies - this bucket is scoped to what those fields alone can prove. Meeting-response prefixes live in two separate config lists so localisation is unambiguous:
 
-- **Retrospective receipts** (`Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`): a record of a response that has *already happened*. These are logistics noise whether or not the meeting itself is still upcoming - an "Accepted:" receipt from two weeks ago adds nothing to the inbox - so they are eligible on prefix + age + calendar-sender alone.
-- **Forward-looking notices** (`Canceled:`, `Cancelled:`, `Updated invitation:`): these refer to the *meeting*, which may still be in the future or part of a live recurring series. That status cannot be verified without calendar access, so these are **left in the inbox** (never auto-bucketed) rather than guessed at.
+- **Retrospective receipts** (`config.meetingResponsePrefixes`, defaults `Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`): a record of a response that has *already happened*. These are logistics noise whether or not the meeting itself is still upcoming - an "Accepted:" receipt from two weeks ago adds nothing to the inbox - so they are eligible for `pastEvents`.
+- **Forward-looking notices** (`config.meetingForwardLookingPrefixes`, defaults `Canceled:`, `Cancelled:`, `Updated invitation:`): these refer to the *meeting*, which may still be in the future or part of a live recurring series. That status cannot be verified without calendar access, so these are **left in the inbox** (never auto-bucketed) rather than guessed at.
+
+Keeping the two lists separate is what makes localisation safe: add a localised `Accepted:` to `meetingResponsePrefixes` and a localised `Canceled:` to `meetingForwardLookingPrefixes`, and each stays in its correct group.
 
 **Positive tests (all required):**
 
-- Subject starts with one of the **retrospective-receipt** prefixes in `config.meetingResponsePrefixes` (defaults: `Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`). Forward-looking prefixes (`Canceled:`, `Cancelled:`, `Updated invitation:`) are recognised but excluded per the note above. Add localised prefixes to this config value when the user's Outlook language is not English - the skill does not guess translations at run time.
+- Subject starts with one of the **retrospective-receipt** prefixes in `config.meetingResponsePrefixes`. A subject carrying one of these prefixes IS the calendar-response signal - a meeting-response receipt is normally sent **from the responding attendee's own address** (e.g. `Sarah Chen`), so do NOT additionally require the sender to be a calendar system; that would exclude the very receipts this bucket targets. A sender of `Microsoft Outlook`/`Exchange`/`Teams` is confirming evidence when present, not a gate. Add localised prefixes to `meetingResponsePrefixes` when the user's Outlook language is not English - the skill does not guess translations at run time.
 - Received time is older than `pastEventMinAgeDays` (default 7 days).
-- Sender is a calendar system (`Microsoft Outlook`, `Exchange`, `Teams`) or the mail is a calendar-response notification.
 
 **Negative tests (any one blocks):**
 
-- Subject uses a forward-looking prefix (`Canceled:`, `Cancelled:`, `Updated invitation:`) - left in inbox because the meeting may be upcoming and that cannot be verified from the collected fields.
+- Subject starts with a **forward-looking** prefix from `config.meetingForwardLookingPrefixes` - left in inbox because the meeting may be upcoming and that cannot be verified from the collected fields.
 - Sender or attendees include the user's manager or a direct report (protection layer catches this too).
 
 **Worked example.**
 
-- Subject `Accepted: Weekly design sync`, received 3 weeks ago, sender `Sarah Chen`. Bucket: `pastEvents` (a receipt of a response already made, older than 7 days, calendar-response pattern - eligible regardless of the meeting's future date).
+- Subject `Accepted: Weekly design sync`, received 3 weeks ago, sender `Sarah Chen` (an attendee's own address). Bucket: `pastEvents` (a receipt of a response already made, older than 7 days - eligible regardless of the meeting's future date, and regardless of the sender being a person rather than a calendar system).
 - Subject `Updated invitation: Quarterly review`, received today, sender `Marcus Diaz`. Bucket: none (forward-looking prefix and recent - left in inbox).
 - Subject `Canceled: Budget planning`, received 2 weeks ago. Bucket: none (forward-looking prefix; the series may still be active and that cannot be checked without calendar access).
 
@@ -153,7 +154,7 @@ Even matching every positive test, these mail types never enter a bucket:
 - Any message from the user's manager or a direct report.
 - Any message from a sender the user has emailed within `activeThreadWindowDays` (default 14).
 - Any inbound message within the `activeThreadWindowDays` active-thread window whose sender is not a bulk-mail or automation source (a newsletter that arrives weekly is not an "active thread").
-- Any unread message received in the last 3 days, with one narrow exception: a high-confidence automation sender (local part `noreply|no-reply|donotreply|do-not-reply|notifications|alerts|automated|system|bot`) can still be classified as `notifications`. Newsletters cannot bypass this rule.
+- Any unread message received in the last 3 days, with one narrow exception: a high-confidence automation sender (sender local part matches a **bounded** automation token as defined in the `notifications` rule above - `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `bot`, etc. - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) can still be classified as `notifications`. Newsletters cannot bypass this rule.
 
 ## Unsubscribe extraction
 
