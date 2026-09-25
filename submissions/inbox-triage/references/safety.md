@@ -14,7 +14,7 @@ The protection layer is the reason this skill is safe to run. Every rule below e
 
 ## Rule: Active thread
 
-**What it does.** A sender is protected if the user has emailed that sender's address in the last 14 days (from the Sent-window listing). A sender is also protected if the sender has emailed the user in the last 14 days AND the sender does not match a bulk-mail or automation pattern (no `List-Unsubscribe` header, sender not on the bulk-mail/automation domain list).
+**What it does.** A sender is protected if the user has emailed that sender's address within `activeThreadWindowDays` (default 14; from the Sent-window listing). A sender is also protected if the sender has emailed the user within `activeThreadWindowDays` AND the sender does not match a bulk-mail or automation pattern (no `List-Unsubscribe` header, sender not on the bulk-mail/automation domain list). The Sent and inbound windows are both driven by this one configured value, so changing it widens or narrows the protection consistently.
 
 **Why it exists.** Active conversations are conversations. A newsletter you unsubscribed from and forgot about is not active. A colleague you talked to last week about a project *is* active, even if this specific message reads like a broadcast. The asymmetry (user-sent recency counts for anyone, inbound recency counts only for non-bulk senders) matters: without it, weekly newsletters and daily automation notifications would be treated as active threads and never triaged.
 

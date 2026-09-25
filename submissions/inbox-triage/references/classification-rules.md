@@ -12,7 +12,7 @@ If a message matches signals for two buckets, prefer in this order:
 4. `duplicates`
 5. `resolved`
 
-Notifications wins over newsletters because a bug tracker digest that happens to include a `List-Unsubscribe` header is still a notification. Past-events wins over duplicates because the intent ("this is meeting logistics from a past event") is more specific. Duplicates wins over resolved because moving redundant older thread messages is a lower-risk action than declaring a whole thread resolved.
+Notifications wins over newsletters because a bug tracker digest that happens to include a `List-Unsubscribe` header is still a notification. Past-events wins over duplicates because the intent ("this is meeting logistics from a past event") is more specific. Duplicates wins over resolved because moving a redundant identical copy is a lower-risk action than declaring a whole thread resolved.
 
 ## newsletters
 
@@ -78,22 +78,27 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 ## pastEvents
 
+Because Step 1 collects only subject, sender, and received time - it does **not** open calendar items or message bodies - this bucket is scoped to what those fields alone can prove. The meeting-response prefixes split into two groups:
+
+- **Retrospective receipts** (`Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`): a record of a response that has *already happened*. These are logistics noise whether or not the meeting itself is still upcoming - an "Accepted:" receipt from two weeks ago adds nothing to the inbox - so they are eligible on prefix + age + calendar-sender alone.
+- **Forward-looking notices** (`Canceled:`, `Cancelled:`, `Updated invitation:`): these refer to the *meeting*, which may still be in the future or part of a live recurring series. That status cannot be verified without calendar access, so these are **left in the inbox** (never auto-bucketed) rather than guessed at.
+
 **Positive tests (all required):**
 
-- Subject starts with one of the prefixes in `config.meetingResponsePrefixes` (defaults: `Accepted:`, `Declined:`, `Tentative:`, `Canceled:`, `Cancelled:`, `Updated invitation:`, `Meeting Forward Notification:`). Add localised prefixes to this config value when the user's Outlook language is not English - the skill does not guess translations at run time.
+- Subject starts with one of the **retrospective-receipt** prefixes in `config.meetingResponsePrefixes` (defaults: `Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`). Forward-looking prefixes (`Canceled:`, `Cancelled:`, `Updated invitation:`) are recognised but excluded per the note above. Add localised prefixes to this config value when the user's Outlook language is not English - the skill does not guess translations at run time.
 - Received time is older than `pastEventMinAgeDays` (default 7 days).
 - Sender is a calendar system (`Microsoft Outlook`, `Exchange`, `Teams`) or the mail is a calendar-response notification.
 
 **Negative tests (any one blocks):**
 
-- Subject references a meeting still in the future - check the meeting date in the message subject/body if visible in the header preview.
+- Subject uses a forward-looking prefix (`Canceled:`, `Cancelled:`, `Updated invitation:`) - left in inbox because the meeting may be upcoming and that cannot be verified from the collected fields.
 - Sender or attendees include the user's manager or a direct report (protection layer catches this too).
-- The referenced meeting is a recurring series that is still occurring.
 
 **Worked example.**
 
-- Subject `Accepted: Weekly design sync`, received 3 weeks ago, sender `Sarah Chen`. Bucket: `pastEvents` (older than 7 days, calendar-response pattern).
-- Subject `Updated invitation: Quarterly review`, received today, sender `Marcus Diaz`. Bucket: none (recent, still active).
+- Subject `Accepted: Weekly design sync`, received 3 weeks ago, sender `Sarah Chen`. Bucket: `pastEvents` (a receipt of a response already made, older than 7 days, calendar-response pattern - eligible regardless of the meeting's future date).
+- Subject `Updated invitation: Quarterly review`, received today, sender `Marcus Diaz`. Bucket: none (forward-looking prefix and recent - left in inbox).
+- Subject `Canceled: Budget planning`, received 2 weeks ago. Bucket: none (forward-looking prefix; the series may still be active and that cannot be checked without calendar access).
 
 ## resolved
 
@@ -118,22 +123,25 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 ## duplicates
 
+A `duplicates` match is a genuine **redundant copy** of a message - the *same* message delivered to the inbox more than once (a classic cause: the user is both a direct recipient and on a distribution list that also delivers, so two identical copies land). Redundant copies share the same `internetMessageId` (the RFC 5322 Message-ID header). This is deliberately NOT "every older message in a thread": distinct replies on one `conversationId` are different messages, each with its own `internetMessageId`, and each may carry unique decisions or content - moving them would bury real conversation history.
+
 **Positive tests (all required):**
 
-- Thread has 2+ messages present in inbox.
-- Message is not the newest message in its thread.
+- Two or more inbox messages share the same `internetMessageId`.
+- The message under test is not the copy being kept (the newest copy by received time is kept; the rest are the duplicates).
 
 **Negative tests (any one blocks):**
 
-- Any older message contains an attachment the newer message does not.
-- Any older message carries a sensitivity label.
-- Any older message is flagged.
+- Any copy carries an attachment another copy does not.
+- Any copy carries a sensitivity label.
+- Any copy is flagged.
+- `internetMessageId` is missing/empty on the message (without it, redundancy cannot be proven - leave the message in the inbox).
 
-The safe way to bucket duplicates is to move the older ones only; the newest message in every thread stays in the inbox to preserve the thread anchor.
+The safe way to bucket duplicates is to keep one copy (the newest) in the inbox and move only the other identical copies.
 
 **Worked example.**
 
-- Thread has 4 messages in inbox. Older 3 are moved; newest stays. If the older 3 include one with an attachment, that one stays too; only the truly redundant older messages move.
+- The same message (identical `internetMessageId`) appears 3 times in the inbox because the user is a direct recipient and also on two lists that deliver. Two copies move; the newest copy stays. A four-message *thread* (four different `internetMessageId`s on one `conversationId`) is NOT a duplicate set - none of those move under this bucket.
 
 ## What never gets triaged
 
@@ -143,8 +151,8 @@ Even matching every positive test, these mail types never enter a bucket:
 - Any message from HR, Legal, Finance, or Security senders (matched via `protection.sensitiveDomains` or `protection.sensitiveLocalParts`).
 - Any flagged/starred message.
 - Any message from the user's manager or a direct report.
-- Any message from a sender the user has emailed in the last 14 days.
-- Any inbound message during the 14-day active-thread window whose sender is not a bulk-mail or automation source (a newsletter that arrives weekly is not an "active thread").
+- Any message from a sender the user has emailed within `activeThreadWindowDays` (default 14).
+- Any inbound message within the `activeThreadWindowDays` active-thread window whose sender is not a bulk-mail or automation source (a newsletter that arrives weekly is not an "active thread").
 - Any unread message received in the last 3 days, with one narrow exception: a high-confidence automation sender (local part `noreply|no-reply|donotreply|do-not-reply|notifications|alerts|automated|system|bot`) can still be classified as `notifications`. Newsletters cannot bypass this rule.
 
 ## Unsubscribe extraction

@@ -48,7 +48,7 @@ The point is that you can trust this skill enough to actually run it. A destruct
 A message is protected (and never triaged) if any of these are true:
 
 - **From your manager or a direct report.** Resolved once per run via the platform's M365 lookup (WorkIQ on Scout, the equivalent M365 tool on Cowork).
-- **Active thread** - you've emailed the sender in the last 14 days, or a non-bulk sender has emailed you in that window.
+- **Active thread** - you've emailed the sender within `activeThreadWindowDays` (default 14), or a non-bulk sender has emailed you in that window.
 - **Flagged or starred.**
 - **Sensitivity label** of Confidential or above.
 - **Sensitive sender** - HR, Legal, Finance, or Security addresses matched by local part or domain (configurable).
