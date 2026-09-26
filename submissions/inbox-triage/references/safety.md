@@ -34,7 +34,7 @@ The protection layer is the reason this skill is safe to run. Every rule below e
 
 ## Rule: Sensitive sender
 
-**What it does.** Any sender whose local part matches `protection.sensitiveLocalParts` (defaults: `hr`, `payroll`, `benefits`, `legal`, `compliance`, `finance`, `treasury`, `security`) or whose domain matches `protection.sensitiveDomains` is protected.
+**What it does.** Any sender whose local part matches `protection.sensitiveLocalParts` (defaults: `hr`, `payroll`, `benefits`, `legal`, `compliance`, `finance`, `treasury`, `security`) or whose domain matches `protection.sensitiveDomains` is protected. Local-part matching is by **bounded segment**: split the local part on separators (`-`, `_`, `.`, `+`) and protect it when the whole local part equals a configured token or any segment does. So `hr-notifications@` and `it-security@` are protected, while a name like `hrachya@` is not falsely matched. This is intentionally the inclusive direction (protect more), never exact-string only - an exact match would let `hr-notifications@` slip into the notifications bucket.
 
 **Why it exists.** Mail from these functions is often compliance-critical (offer letter, retention notice, W-2 available, security incident). It can look automated (from `hr-notifications@`), which without this rule would put it in the notifications bucket. The wrong triage of one of these can have real consequences.
 
