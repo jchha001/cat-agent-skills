@@ -66,6 +66,6 @@ Specific expected non-error responses:
 
 **Cache the org chart for the run.** Manager and direct reports are resolved once at the start of Step 2. Do not call again per-message.
 
-**Never re-list to answer a follow-up view.** The full set of candidates lives in one working set after Step 1. Every downstream operation - protection, classification, grouping, plan rendering - works from that set in memory. Do not re-list.
+**Never re-list to answer a follow-up view.** The full set of candidates lives in one working set after Step 1. Every downstream *classification and planning* operation - protection classification, grouping, plan rendering - works from that set in memory. Do not re-list to re-render or re-explore the plan. **Exception:** the execution-time protection refresh in Step 6.5 is required, not a follow-up view. Before moving mail, protection state must be current, so re-listing the Sent-window and inbound active-thread windows when the cached evidence has gone stale (and re-fetching the specific message being moved) is mandatory - never skip that refresh under this rule. The distinction: re-listing to *re-answer a question the working set already answers* is prohibited; re-listing to *obtain fresh protection evidence at execution time* is required.
 
 **Move in the smallest useful batches.** The move capability may only move one at a time in some builds; if so, execute serially and report progress ("moved 50 of 312"). Do not parallelise moves across buckets; execute one approved bucket to completion before starting the next.
