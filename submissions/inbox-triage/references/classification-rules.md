@@ -126,19 +126,21 @@ Keeping the two lists separate is what makes localisation safe: add a localised 
 
 A `duplicates` match is a genuine **redundant copy** of a message - the *same* message delivered to the inbox more than once (a classic cause: the user is both a direct recipient and on a distribution list that also delivers, so two identical copies land). Redundant copies share the same `internetMessageId` (the RFC 5322 Message-ID header). This is deliberately NOT "every older message in a thread": distinct replies on one `conversationId` are different messages, each with its own `internetMessageId`, and each may carry unique decisions or content - moving them would bury real conversation history.
 
+**Group before protection filtering.** Build the `internetMessageId` groups over the **full Step 1 inbox set - including any copy that the Step 2 protection layer removed from the candidate set** - not over the post-protection survivors. Otherwise a protected copy is invisible here: with three copies sharing a Message-ID, if one copy is flagged or sensitivity-labelled, Step 2 removes only that copy, and the two survivors would still form a duplicate pair and one would be moved - defeating both the hard protection rule and the "any copy" tests below. A protection reason on **any** copy propagates to the whole group: if any member of an `internetMessageId` group is protected (flagged, sensitivity-labelled, manager/direct-report, active-thread, sensitive sender, allowlisted, unread-and-recent, or any other Step 2 reason), the entire group is left in the inbox and none of its copies move.
+
 **Positive tests (all required):**
 
-- Two or more inbox messages share the same `internetMessageId`.
+- Two or more inbox messages (across the full Step 1 set) share the same `internetMessageId`.
+- No copy in the group carries any Step 2 protection reason (see "Group before protection filtering" above).
 - The message under test is not the copy being kept (the newest copy by received time is kept; the rest are the duplicates).
 
-**Negative tests (any one blocks):**
+**Negative tests (any one blocks the whole group):**
 
 - Any copy carries an attachment another copy does not.
-- Any copy carries a sensitivity label.
-- Any copy is flagged.
+- Any copy carries a sensitivity label, is flagged, or triggers any other Step 2 protection reason (evaluated over all copies, including protection-removed ones).
 - `internetMessageId` is missing/empty on the message (without it, redundancy cannot be proven - leave the message in the inbox).
 
-The safe way to bucket duplicates is to keep one copy (the newest) in the inbox and move only the other identical copies.
+The safe way to bucket duplicates is to keep one copy (the newest) in the inbox and move only the other identical copies, and only when no copy in the group is protected.
 
 **Worked example.**
 
