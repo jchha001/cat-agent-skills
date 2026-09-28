@@ -25,7 +25,6 @@
   "pastEventMinAgeDays": 7,
   "sampleSendersPerBucket": 5,
   "folders": {
-    "root": "Inbox Triage",
     "newsletters": "Inbox Triage/Newsletters",
     "notifications": "Inbox Triage/Notifications",
     "pastEvents": "Inbox Triage/Past events",

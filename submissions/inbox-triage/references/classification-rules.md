@@ -31,7 +31,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
   - `constantcontact.com`, `ccsend.com`
   - `sparkpostmail.com`
   - `amazonses.com` (when sender local-part suggests marketing)
-- Sender local part matches, case-insensitive: `newsletter|digest|weekly|marketing|hello|news|updates|team|team-updates|community`.
+- Sender local part matches one of these **bounded** tokens (equal to the token, or the token immediately followed by a separator `-`/`_`/`.`/`+` or a digit - the same prefix-boundary rule as the `notifications` list; note the sensitive-sender protection uses a broader segment-equality match, which is intentionally more inclusive and does not apply here). This boundary means `agnews@` (contains `news`), `steam@` (contains `team`), and `othello@` (contains `hello`) are NOT false positives, case-insensitive: `newsletter`, `digest`, `weekly`, `marketing`, `hello`, `news`, `updates`, `team`, `team-updates`, `community`.
 
 **Negative tests (any one blocks):**
 
@@ -78,7 +78,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 ## pastEvents
 
-Because Step 1 collects only subject, sender, and received time - it does **not** open calendar items or message bodies - this bucket is scoped to what those fields alone can prove. Meeting-response prefixes live in two separate config lists so localisation is unambiguous:
+Because Step 1 collects only header/envelope metadata - subject, sender, To/Cc recipients, received time, read/flag/label state - and does **not** open calendar items or message bodies, this bucket is scoped to what those fields alone can prove. Meeting-response prefixes live in two separate config lists so localisation is unambiguous:
 
 - **Retrospective receipts** (`config.meetingResponsePrefixes`, defaults `Accepted:`, `Declined:`, `Tentative:`, `Meeting Forward Notification:`): a record of a response that has *already happened*. These are logistics noise whether or not the meeting itself is still upcoming - an "Accepted:" receipt from two weeks ago adds nothing to the inbox - so they are eligible for `pastEvents`.
 - **Forward-looking notices** (`config.meetingForwardLookingPrefixes`, defaults `Canceled:`, `Cancelled:`, `Updated invitation:`): these refer to the *meeting*, which may still be in the future or part of a live recurring series. That status cannot be verified without calendar access, so these are **left in the inbox** (never auto-bucketed) rather than guessed at.
@@ -93,7 +93,7 @@ Keeping the two lists separate is what makes localisation safe: add a localised 
 **Negative tests (any one blocks):**
 
 - Subject starts with a **forward-looking** prefix from `config.meetingForwardLookingPrefixes` - left in inbox because the meeting may be upcoming and that cannot be verified from the collected fields.
-- Sender or attendees include the user's manager or a direct report (protection layer catches this too).
+- Sender or any To/Cc recipient is the user's manager or a direct report (protection layer catches this too; evaluated over the To/Cc addresses collected in Step 1, not an uncollected attendee list).
 
 **Worked example.**
 
@@ -113,7 +113,7 @@ Keeping the two lists separate is what makes localisation safe: add a localised 
 **Negative tests (any one blocks):**
 
 - Any protection reason applies (org chart, active thread, flag, label, sensitive sender, allowlist).
-- Thread mentions a stated future deadline (search subject and last-message preview for date-like tokens).
+- A **subject line** date-like token suggests a stated future deadline (search the subject only; Step 1 does not collect bodies or previews, so a body-based deadline cannot be evaluated - when in doubt, leave the thread in the inbox rather than assume none).
 - Thread is with someone at the user's own domain AND involves more than 3 messages (internal working threads deserve a higher bar).
 - The full thread state cannot be confirmed from the collected listings - the newest-message check must succeed on real data, not a guess.
 
@@ -156,7 +156,7 @@ Even matching every positive test, these mail types never enter a bucket:
 - Any message from the user's manager or a direct report.
 - Any message from a sender the user has emailed within `activeThreadWindowDays` (default 14).
 - Any inbound message within the `activeThreadWindowDays` active-thread window whose sender is not a bulk-mail or automation source (a newsletter that arrives weekly is not an "active thread").
-- Any unread message received within `protection.unreadRecentProtectionDays` (default 3 days), with one narrow exception: a high-confidence automation sender (sender local part matches a **bounded** automation token as defined in the `notifications` rule above - `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `bot`, etc. - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) can still be classified as `notifications`. Newsletters cannot bypass this rule.
+- Any unread message received within `protection.unreadRecentProtectionDays` (default 3 days), with one narrow exception: a high-confidence automation sender (sender local part matches a **bounded** automation token from the **full `notifications` token list above** - `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `robot`, `bot`, `jenkins`, `ci`, `deploy` - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) can still be classified as `notifications`. The exception uses the entire list, not a subset. Newsletters cannot bypass this rule.
 
 ## Unsubscribe extraction
 
