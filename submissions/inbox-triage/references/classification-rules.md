@@ -37,7 +37,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 - Sender is on the user's org allowlist.
 - Sender is a colleague at the user's own domain (do not classify internal mail as newsletter even if a mailing platform stamps it).
-- Message is unread AND received in the last 3 days (protection layer, but reinforced here).
+- Message is unread AND received within `protection.unreadRecentProtectionDays` (default 3 days) (protection layer, but reinforced here).
 
 **Worked example.**
 
@@ -154,7 +154,7 @@ Even matching every positive test, these mail types never enter a bucket:
 - Any message from the user's manager or a direct report.
 - Any message from a sender the user has emailed within `activeThreadWindowDays` (default 14).
 - Any inbound message within the `activeThreadWindowDays` active-thread window whose sender is not a bulk-mail or automation source (a newsletter that arrives weekly is not an "active thread").
-- Any unread message received in the last 3 days, with one narrow exception: a high-confidence automation sender (sender local part matches a **bounded** automation token as defined in the `notifications` rule above - `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `bot`, etc. - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) can still be classified as `notifications`. Newsletters cannot bypass this rule.
+- Any unread message received within `protection.unreadRecentProtectionDays` (default 3 days), with one narrow exception: a high-confidence automation sender (sender local part matches a **bounded** automation token as defined in the `notifications` rule above - `noreply`, `no-reply`, `donotreply`, `do-not-reply`, `notifications`, `alerts`, `automated`, `system`, `bot`, etc. - equal to the token or token-plus-separator/digit, so `botany@`/`systematic@` do not qualify) can still be classified as `notifications`. Newsletters cannot bypass this rule.
 
 ## Unsubscribe extraction
 
