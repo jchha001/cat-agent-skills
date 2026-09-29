@@ -106,7 +106,7 @@ Keeping the two lists separate is what makes localisation safe: add a localised 
 **Positive tests (all required):**
 
 - Thread (`conversationId`) has at least 2 messages present across the Inbox and Sent listings from Step 1.
-- The newest message across Inbox and Sent for that `conversationId` is FROM the user.
+- The newest message across Inbox and Sent for that `conversationId` is FROM the user - meaning a Sent-folder item whose `from` address matches the user's own profile address, **not merely an item that lives in the Sent folder** (in a delegated or shared mailbox a Sent item may be authored by another identity). If the `from` identity cannot be confirmed to be the user, do not treat the thread as user-sent.
 - That newest user-sent message is older than `resolvedThreadMinAgeDays` (default 60 days).
 - No newer inbound reply exists in either listing.
 
