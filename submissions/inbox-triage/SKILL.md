@@ -121,7 +121,7 @@ Auto-clicking mailto unsubscribes sends mail from the user's address to unknown 
 Return a single Markdown plan grouped by bucket. Order buckets by bucket size, largest first. For each bucket:
 
 ```
-### Bucket: Newsletters (312 messages, 4 senders)
+### Bucket: Newsletters (312 messages, 5 senders)
 
 Sample senders (top `config.sampleSendersPerBucket`, default 5, by count):
   - Morning Brew <newsletter@morningbrew.com>            47 msgs, newest 2d ago

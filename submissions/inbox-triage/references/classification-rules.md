@@ -59,7 +59,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
   - `datadoghq.com`
   - `snyk.io`
   - `dependabot.com`
-  - `circleci.com`, `travis-ci.com`, `github-actions.workflow`
+  - `circleci.com`, `travis-ci.com`, `github.com` messages whose sender display name or subject identifies GitHub Actions / workflow automation
   - `newrelic.com`
   - `sentry.io`
   - `hubspot.com` when subject matches `notification|assigned|reminder`
