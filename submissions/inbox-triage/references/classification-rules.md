@@ -2,6 +2,13 @@
 
 Read this during Step 3. Each bucket has a positive test, a negative test, and a worked example. A message enters a bucket only if the positive test matches and no negative test fires. When in doubt, leave in inbox - under-triaging is safe, over-triaging destroys trust.
 
+## Global leave-in-inbox exclusions
+
+Apply these checks before bucket ordering. If any one fires, the message stays in the inbox and is not considered for **any** bucket, even if it has a `List-Unsubscribe` header, an automation sender, or another positive bucket signal:
+
+- `notifications@github.com` where the subject contains `security advisory` or `vulnerability` (case-insensitive). Security alerts are for the user, not for triage; do not let the same message fall through to `newsletters` just because it carries `List-Unsubscribe`.
+- Any subject that starts with a forward-looking meeting prefix from `config.meetingForwardLookingPrefixes` (defaults: `Canceled:`, `Cancelled:`, `Updated invitation:`). These may refer to an upcoming or still-active meeting; do not let them fall through to `notifications`, `newsletters`, or any other bucket.
+
 ## Bucket order
 
 If a message matches signals for two buckets, prefer in this order:
@@ -67,7 +74,7 @@ Notifications wins over newsletters because a bug tracker digest that happens to
 
 **Negative tests (any one blocks):**
 
-- Sender is `notifications@github.com` AND subject contains "security advisory" or "vulnerability". Route these to inbox - security alerts are for the user, not for triage.
+- Sender is `notifications@github.com` AND subject contains "security advisory" or "vulnerability". This is also a **global leave-in-inbox exclusion** above, so it blocks every bucket, not just `notifications`.
 - Sender is at the user's own domain (internal automation the user may still need to see).
 - Message is flagged.
 
@@ -92,7 +99,7 @@ Keeping the two lists separate is what makes localisation safe: add a localised 
 
 **Negative tests (any one blocks):**
 
-- Subject starts with a **forward-looking** prefix from `config.meetingForwardLookingPrefixes` - left in inbox because the meeting may be upcoming and that cannot be verified from the collected fields.
+- Subject starts with a **forward-looking** prefix from `config.meetingForwardLookingPrefixes` - this is also a **global leave-in-inbox exclusion** above, so it blocks every bucket, not just `pastEvents`.
 - Sender or any To/Cc recipient is the user's manager or a direct report (protection layer catches this too; evaluated over the To/Cc addresses collected in Step 1, not an uncollected attendee list).
 
 **Worked example.**
